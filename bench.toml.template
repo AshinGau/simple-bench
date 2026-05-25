@@ -1,0 +1,15 @@
+[faucet]
+private_key = "0x..."
+faucet_eth_balance = 5000
+
+[rpc]
+url = "https://mainnet-rpc.gravity.xyz"
+
+[bench]
+num_accounts = 100
+num_senders = 50
+transfer_type = "native"
+max_fee_per_gas = 50
+max_priority_fee_per_gas = 1
+num_tokens = 2
+max_pool_size = 40000
