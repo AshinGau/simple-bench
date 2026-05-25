@@ -22,11 +22,6 @@ impl Account {
         })
     }
 
-    pub async fn init_nonce(&mut self, rpc: &RpcClient) -> Result<()> {
-        self.nonce = rpc.get_nonce(self.address).await?;
-        Ok(())
-    }
-
     pub async fn balance(&self, rpc: &RpcClient) -> Result<U256> {
         rpc.get_balance(self.address).await
     }

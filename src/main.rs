@@ -5,16 +5,17 @@ mod rpc;
 mod stats;
 mod tx;
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, Bytes, B256, U256};
 use anyhow::Result;
 use clap::Parser;
+use tokio::sync::{mpsc, oneshot};
 
 use account::Account;
 use config::{Config, TransferType};
-use monitor::RegisterTx;
+use monitor::{MonitorCommand, RegisterTx};
 use rpc::RpcClient;
 use stats::Stats;
 
@@ -37,187 +38,218 @@ async fn main() -> Result<()> {
     let config_path = cli.config.unwrap_or_else(|| "bench.toml".to_string());
     let config = Config::load(&config_path)?;
     let chain_id = detect_chain_id(&config.rpc.url).await?;
-    let rpc = RpcClient::new(&config.rpc.url, chain_id);
+    let rpc = RpcClient::new(&config.rpc.url, chain_id, config.bench.rpc_concurrency);
 
-    // Derive accounts
-    let worker_keys = config::derive_worker_keys(&config.faucet.private_key, config.bench.num_accounts);
+    let worker_keys =
+        config::derive_worker_keys(&config.faucet.private_key, config.bench.num_accounts);
     let mut accounts: Vec<Account> = worker_keys
         .iter()
         .map(|k| Account::from_key(k))
         .collect::<Result<_>>()?;
 
+    let (register_tx, register_rx) = mpsc::channel::<MonitorCommand>(100000);
+    let mut block_monitor = monitor::BlockMonitor::new(rpc.clone(), register_rx, cli.receipt);
+    let pool_size = block_monitor.pool_size.clone();
+    tokio::spawn(async move {
+        if let Err(e) = block_monitor.run().await {
+            log::error!("[monitor] exited: {}", e);
+        }
+    });
+
     if cli.recover {
-        recover(&mut accounts, &config, &rpc, chain_id).await?;
+        recover(&mut accounts, &config, &rpc, chain_id, register_tx.clone()).await?;
         return Ok(());
     }
 
-    // Start block monitor
-    let (register_tx, register_rx) = tokio::sync::mpsc::channel::<RegisterTx>(100000);
-    let mut block_monitor = monitor::BlockMonitor::new(rpc.clone(), register_rx, cli.receipt);
+    distribute_funds(&accounts, &config, &rpc, chain_id, register_tx.clone()).await?;
 
-    // Distribute funds
-    distribute_funds(&accounts, &config, &rpc, chain_id).await?;
-
-    // Deploy ERC20 tokens if needed
     let token_addresses: Vec<Address> = if config.bench.transfer_type == TransferType::Erc20 {
-        deploy_tokens(&accounts[0], &config, &rpc, chain_id).await?
+        let addrs =
+            deploy_tokens(&accounts[0], &config, &rpc, chain_id, register_tx.clone()).await?;
+        distribute_tokens(
+            &accounts[0],
+            &accounts,
+            &addrs,
+            &config,
+            &rpc,
+            chain_id,
+            register_tx.clone(),
+        )
+        .await?;
+        addrs
     } else {
         vec![]
     };
 
-    // Init nonces
-    for acc in accounts.iter_mut() {
-        acc.init_nonce(&rpc).await?;
-    }
-
     log::info!(
-        "[启动] {} accounts, 每账户 {} ETH, chain_id={}",
+        "[init] {} workers, chain_id={}, type={:?}, rpc_concurrency={}, num_inflight_senders={}",
         accounts.len(),
-        config.faucet.faucet_eth_balance / U256::from(accounts.len() as u64),
-        chain_id
+        chain_id,
+        config.bench.transfer_type,
+        config.bench.rpc_concurrency,
+        config.bench.num_inflight_senders
     );
 
     let stats = Arc::new(Stats::new());
     let stop = Arc::new(AtomicBool::new(false));
     let active_count = Arc::new(AtomicUsize::new(accounts.len()));
+    let inflight_sender_sem = Arc::new(tokio::sync::Semaphore::new(
+        config.bench.num_inflight_senders,
+    ));
 
-    // Stats logging
-    let stats_clone = stats.clone();
-    let stop_clone = stop.clone();
-    let active_clone = active_count.clone();
-    let stats_handle = tokio::spawn(async move {
-        while !stop_clone.load(Ordering::Relaxed) {
-            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            let active = active_clone.load(Ordering::Relaxed);
-            if active > 0 {
-                stats_clone.log_summary(active);
-            }
-        }
-    });
-
-    // Spawn workers
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(config.bench.num_senders));
-    let mut handles = Vec::new();
-
-    for (idx, account) in accounts.into_iter().enumerate() {
-        let rpc = rpc.clone();
-        let config = config.clone();
+    {
         let stats = stats.clone();
-        let sem = semaphore.clone();
-        let pool = block_monitor.pool_size.clone();
+        let stop = stop.clone();
         let active = active_count.clone();
-        let tokens = token_addresses.clone();
-        let reg_tx = register_tx.clone();
-
-        let handle = tokio::spawn(async move {
-            let result = run_worker(idx, account, &config, &rpc, &stats, &sem, &pool, &tokens, reg_tx).await;
-            active.fetch_sub(1, Ordering::Relaxed);
-            match result {
-                Ok(()) => log::info!("[结束] 账户 #{} 余额不足, 已移除", idx),
-                Err(e) => log::error!("[错误] 账户 #{}: {}", idx, e),
+        tokio::spawn(async move {
+            while !stop.load(Ordering::Relaxed) {
+                tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                if active.load(Ordering::Relaxed) > 0 {
+                    stats.log_summary(active.load(Ordering::Relaxed));
+                }
             }
         });
-
-        handles.push(handle);
     }
 
-    // Start monitor (must be after workers so register_tx is created first)
-    let monitor_handle = tokio::spawn(async move {
-        if let Err(e) = block_monitor.run().await {
-            log::error!("[monitor] error: {}", e);
-        }
-    });
+    let mut handles = Vec::new();
+    for (idx, account) in accounts.into_iter().enumerate() {
+        let active = active_count.clone();
+        let ctx = WorkerCtx {
+            config: config.clone(),
+            rpc: rpc.clone(),
+            stats: stats.clone(),
+            inflight_sender_sem: inflight_sender_sem.clone(),
+            pool_size: pool_size.clone(),
+            token_addresses: token_addresses.clone(),
+            register_tx: register_tx.clone(),
+        };
 
-    // Wait for all workers
+        handles.push(tokio::spawn(async move {
+            let result = run_worker(idx, account, ctx).await;
+            active.fetch_sub(1, Ordering::Relaxed);
+            match result {
+                Ok(()) => log::debug!("[worker#{}] stopped", idx),
+                Err(e) => log::error!("[worker#{}] error: {}", idx, e),
+            }
+        }));
+    }
+
     for h in handles {
         let _ = h.await;
     }
 
     stop.store(true, Ordering::Relaxed);
-    let _ = stats_handle.await;
     stats.log_final();
-    monitor_handle.abort();
-
     Ok(())
 }
 
-async fn run_worker(
-    idx: usize,
-    mut account: Account,
-    config: &Config,
-    rpc: &RpcClient,
-    stats: &Stats,
-    sem: &Arc<tokio::sync::Semaphore>,
-    pool_size: &Arc<std::sync::atomic::AtomicU64>,
-    token_addresses: &[Address],
-    register_tx: tokio::sync::mpsc::Sender<RegisterTx>,
-) -> Result<()> {
-    let token_idx_base = if token_addresses.is_empty() {
-        0
-    } else {
-        idx % token_addresses.len()
-    };
+struct WorkerCtx {
+    config: Config,
+    rpc: RpcClient,
+    stats: Arc<Stats>,
+    inflight_sender_sem: Arc<tokio::sync::Semaphore>,
+    pool_size: Arc<AtomicU64>,
+    token_addresses: Vec<Address>,
+    register_tx: mpsc::Sender<MonitorCommand>,
+}
+
+async fn run_worker(idx: usize, mut account: Account, ctx: WorkerCtx) -> Result<()> {
+    let token_idx = idx % ctx.token_addresses.len().max(1);
 
     loop {
-        // Flow control
-        while pool_size.load(Ordering::Relaxed) > config.bench.max_pool_size {
-            log::warn!(
-                "[流控] mempool pending={} > max={}, 暂停发送...",
-                pool_size.load(Ordering::Relaxed),
-                config.bench.max_pool_size
-            );
+        while ctx.pool_size.load(Ordering::Relaxed) > ctx.config.bench.max_pool_size {
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
         }
 
-        let _permit = sem.acquire().await?;
+        account.nonce = ctx
+            .rpc
+            .get_nonce(account.address)
+            .await
+            .unwrap_or(account.nonce);
 
-        // Check balance
-        let balance = account.balance(rpc).await?;
-        let gas_wei = U256::from(config.bench.max_fee_per_gas) * U256::from(21000u64) * U256::from(1_000_000_000u64);
+        let balance = account.balance(&ctx.rpc).await?;
+        let gas_limit = if ctx.config.bench.transfer_type == TransferType::Native {
+            21000
+        } else {
+            100000
+        };
+        let gas_wei = U256::from(ctx.config.bench.max_fee_per_gas)
+            * U256::from(gas_limit)
+            * U256::from(1_000_000_000u64);
         if balance < gas_wei {
             break;
         }
 
-        // Build transaction
-        let signed = if config.bench.transfer_type == TransferType::Native {
-            let hash = alloy::primitives::keccak256(
-                [account.address.as_slice(), &account.nonce.to_be_bytes()].concat(),
+        let signed = if ctx.config.bench.transfer_type == TransferType::Native {
+            let to = Address::from_slice(
+                &alloy::primitives::keccak256(
+                    [account.address.as_slice(), &account.nonce.to_be_bytes()].concat(),
+                )[12..],
             );
-            let to = Address::from_slice(&hash[12..]);
-            tx::build_native_tx(&account, to, U256::from(1u64), &config.bench, rpc.chain_id).await?
+            tx::build_native_tx(
+                &account,
+                to,
+                U256::from(1),
+                &ctx.config.bench,
+                ctx.rpc.chain_id,
+            )
+            .await?
         } else {
-            let token = token_addresses[token_idx_base];
-            tx::build_erc20_tx(&account, token, account.address, U256::from(1u64), &config.bench, rpc.chain_id).await?
+            tx::build_erc20_tx(
+                &account,
+                ctx.token_addresses[token_idx],
+                account.address,
+                U256::from(1),
+                &ctx.config.bench,
+                ctx.rpc.chain_id,
+            )
+            .await?
         };
 
-        // Send transaction
-        let tx_hash = rpc.send_raw_tx(&signed.raw).await?;
-        stats.inc_sent();
+        let _permit = ctx.inflight_sender_sem.acquire().await?;
+        let hash = tx::raw_tx_hash(&signed.raw);
+        let (reply, rx) = oneshot::channel();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        ctx.register_tx
+            .send(MonitorCommand::Register(RegisterTx {
+                hash,
+                reply,
+                registered: registered_tx,
+            }))
+            .await?;
+        registered_rx.await?;
 
-        // Register with monitor and wait for block-driven receipt
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        register_tx.send(RegisterTx { hash: tx_hash, reply: reply_tx }).await?;
-
-        match reply_rx.await {
-            Ok(true) => {
-                stats.inc_confirmed();
+        match ctx.rpc.send_raw_tx(&signed.raw).await {
+            Ok(returned_hash) => {
+                if returned_hash != hash {
+                    let _ = ctx.register_tx.send(MonitorCommand::Cancel(hash)).await;
+                    ctx.stats.inc_failed();
+                    log::error!(
+                        "[worker#{}] send_raw_tx hash mismatch: expected 0x{}, got 0x{}",
+                        idx,
+                        hex::encode(hash.as_slice()),
+                        hex::encode(returned_hash.as_slice())
+                    );
+                    break;
+                }
+                ctx.stats.inc_sent();
+                match rx.await {
+                    Ok(true) => ctx.stats.inc_confirmed(),
+                    _ => {
+                        ctx.stats.inc_failed();
+                        break;
+                    }
+                }
+                account.nonce += 1;
             }
-            Ok(false) => {
-                stats.inc_failed();
-                log::warn!("[失败] 账户 #{} tx {} reverted", idx, tx_hash);
-                break;
-            }
-            Err(_) => {
-                stats.inc_failed();
-                log::warn!("[错误] 账户 #{} tx {} monitor关闭", idx, tx_hash);
+            Err(e) => {
+                let _ = ctx.register_tx.send(MonitorCommand::Cancel(hash)).await;
+                log::error!("[worker#{}] send_raw_tx: {}", idx, e);
                 break;
             }
         }
-
-        account.nonce += 1;
         drop(_permit);
     }
-
     Ok(())
 }
 
@@ -226,72 +258,101 @@ async fn distribute_funds(
     config: &Config,
     rpc: &RpcClient,
     chain_id: u64,
+    register_tx: mpsc::Sender<MonitorCommand>,
 ) -> Result<()> {
-    let mut faucet = Account::from_key(&config.faucet.private_key)?;
-    faucet.init_nonce(rpc).await?;
+    let faucet = Account::from_key(&config.faucet.private_key)?;
+    let amount = config.faucet.faucet_eth_balance / U256::from(accounts.len() as u64);
+    log::info!(
+        "[init] sending {} wei to {} accounts",
+        amount,
+        accounts.len()
+    );
 
-    let per_account = config.faucet.faucet_eth_balance / U256::from(accounts.len() as u64);
-    log::info!("[启动] Faucet → {} accounts, 每账户 {} wei", accounts.len(), per_account);
-
-    let mut tx_hashes = Vec::with_capacity(accounts.len());
-    for acc in accounts.iter() {
-        let signed = tx::build_native_tx(&faucet, acc.address, per_account, &config.bench, chain_id).await?;
-        let hash = rpc.send_raw_tx(&signed.raw).await?;
-        tx_hashes.push(hash);
-        faucet.nonce += 1;
+    let base_nonce = rpc.get_nonce(faucet.address).await?;
+    let mut raws = Vec::with_capacity(accounts.len());
+    for (i, acc) in accounts.iter().enumerate() {
+        let mut sender = faucet.clone();
+        sender.nonce = base_nonce + i as u64;
+        let signed =
+            tx::build_native_tx(&sender, acc.address, amount, &config.bench, chain_id).await?;
+        raws.push(signed.raw);
     }
 
-    for hash in &tx_hashes {
-        loop {
-            if let Some(receipt) = rpc.get_transaction_receipt(*hash).await? {
-                if receipt["status"].as_str() != Some("0x1") {
-                    log::error!("[启动] 分发交易 {} 失败", hash);
-                }
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-    }
-
-    log::info!("[启动] 分发完成");
+    let hashes = submit_batch_and_confirm(rpc, &register_tx, raws).await?;
+    log::info!("[init] ETH sent to {} accounts", hashes.len());
     Ok(())
 }
 
 async fn deploy_tokens(
-    deployer_account: &Account,
+    deployer: &Account,
     config: &Config,
     rpc: &RpcClient,
     chain_id: u64,
+    register_tx: mpsc::Sender<MonitorCommand>,
 ) -> Result<Vec<Address>> {
-    let bytecode = tx::simple_token_bytecode();
-    let mut deployer = deployer_account.clone();
-    deployer.init_nonce(rpc).await?;
+    let code = tx::simple_token_bytecode();
+    let supply = U256::from(1_000_000_000u64) * U256::from(10u64.pow(18));
+    let base_nonce = rpc.get_nonce(deployer.address).await?;
+    let mut raws = Vec::with_capacity(config.bench.num_tokens);
+    let mut addresses = Vec::with_capacity(config.bench.num_tokens);
 
-    let initial_supply = U256::from(1_000_000_000u64) * U256::from(10u64).pow(U256::from(18));
-
-    let mut addresses = Vec::new();
     for i in 0..config.bench.num_tokens {
-        let signed = tx::build_deploy_tx(&deployer, &bytecode, initial_supply, &config.bench, chain_id).await?;
-        let hash = rpc.send_raw_tx(&signed.raw).await?;
-
-        loop {
-            if let Some(receipt) = rpc.get_transaction_receipt(hash).await? {
-                let addr_str = receipt["contractAddress"].as_str().unwrap_or("0x");
-                let addr_bytes: [u8; 20] = hex::decode(addr_str.trim_start_matches("0x"))?
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid contract address"))?;
-                let addr = Address::from(addr_bytes);
-                log::info!("[启动] ERC20 #{} 部署完成: 0x{:x}", i, addr);
-                addresses.push(addr);
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-        }
-
-        deployer.nonce += 1;
+        let nonce = base_nonce + i as u64;
+        let mut sender = deployer.clone();
+        sender.nonce = nonce;
+        addresses.push(tx::create_address(sender.address, nonce));
+        let signed = tx::build_deploy_tx(&sender, &code, supply, &config.bench, chain_id).await?;
+        raws.push(signed.raw);
     }
 
+    submit_batch_and_confirm(rpc, &register_tx, raws).await?;
+    for (i, address) in addresses.iter().enumerate() {
+        log::info!("[init] ERC20#{} deployed at 0x{:x}", i, address);
+    }
     Ok(addresses)
+}
+
+async fn distribute_tokens(
+    deployer: &Account,
+    accounts: &[Account],
+    tokens: &[Address],
+    config: &Config,
+    rpc: &RpcClient,
+    chain_id: u64,
+    register_tx: mpsc::Sender<MonitorCommand>,
+) -> Result<()> {
+    let amount = U256::from(1_000_000u64) * U256::from(10u64.pow(18));
+    let targets: Vec<&Account> = accounts
+        .iter()
+        .filter(|a| a.address != deployer.address)
+        .collect();
+    if targets.is_empty() || tokens.is_empty() {
+        return Ok(());
+    }
+
+    let base_nonce = rpc.get_nonce(deployer.address).await?;
+    let mut raws = Vec::with_capacity(tokens.len() * targets.len());
+
+    for (ti, token) in tokens.iter().enumerate() {
+        for (ai, acc) in targets.iter().enumerate() {
+            let mut sender = deployer.clone();
+            sender.nonce = base_nonce + (ti * targets.len() + ai) as u64;
+            let signed = tx::build_erc20_tx(
+                &sender,
+                *token,
+                acc.address,
+                amount,
+                &config.bench,
+                chain_id,
+            )
+            .await?;
+            raws.push(signed.raw);
+        }
+    }
+
+    let hashes = submit_batch_and_confirm(rpc, &register_tx, raws).await?;
+    log::info!("[init] tokens distributed: {} txs", hashes.len());
+    Ok(())
 }
 
 async fn recover(
@@ -299,45 +360,171 @@ async fn recover(
     config: &Config,
     rpc: &RpcClient,
     chain_id: u64,
+    register_tx: mpsc::Sender<MonitorCommand>,
 ) -> Result<()> {
-    let faucet_addr = account::faucet_address(&config.faucet.private_key)?;
-    let gas_wei = U256::from(config.bench.max_fee_per_gas) * U256::from(21000u64) * U256::from(1_000_000_000u64);
+    let faucet = account::faucet_address(&config.faucet.private_key)?;
+    let gas =
+        U256::from(config.bench.max_fee_per_gas) * U256::from(21000) * U256::from(1_000_000_000u64);
 
-    for (idx, acc) in accounts.iter_mut().enumerate() {
-        acc.init_nonce(rpc).await?;
-        let balance = acc.balance(rpc).await?;
-        if balance <= gas_wei {
-            if balance > U256::ZERO {
-                log::info!("[恢复] 账户 #{}: 余额 {} 不足以支付gas, 跳过", idx, balance);
+    log::info!(
+        "[recover] scanning {} accounts gas_reserve={} wei",
+        accounts.len(),
+        gas
+    );
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for (i, account) in accounts.iter().cloned().enumerate() {
+        let rpc = rpc.clone();
+        let bench = config.bench.clone();
+        let address = account.address;
+        tasks.spawn(async move {
+            let result = build_recover_tx(account, rpc, bench, faucet, gas, chain_id).await;
+            (i, address, result)
+        });
+    }
+
+    let total = accounts.len();
+    let mut completed = 0usize;
+    let mut raws = Vec::new();
+    let mut skipped = 0usize;
+    let mut errors = 0usize;
+    while let Some(joined) = tasks.join_next().await {
+        let (i, address, result) = joined?;
+        completed += 1;
+        match result {
+            Ok(Some(raw)) => raws.push(raw),
+            Ok(None) => skipped += 1,
+            Err(e) => {
+                errors += 1;
+                log::warn!("[recover] account#{} addr=0x{:x}: {}", i, address, e);
             }
-            continue;
         }
-
-        let recover_amount = balance - gas_wei;
-        let signed = tx::build_native_tx(acc, faucet_addr, recover_amount, &config.bench, chain_id).await?;
-        let hash = rpc.send_raw_tx(&signed.raw).await?;
-
-        loop {
-            if rpc.get_transaction_receipt(hash).await?.is_some() {
-                log::info!("[恢复] 账户 #{}: 回收 {} wei → faucet", idx, recover_amount);
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+        if completed.is_multiple_of(10) || completed == total {
+            log::debug!(
+                "[recover] scanned={} prepared={} skipped={} errors={}",
+                completed,
+                raws.len(),
+                skipped,
+                errors
+            );
         }
     }
 
+    log::info!(
+        "[recover] scan done prepared={} skipped={} errors={}",
+        raws.len(),
+        skipped,
+        errors
+    );
+    if raws.is_empty() {
+        log::info!("[recover] no accounts with balance above gas reserve");
+        return Ok(());
+    }
+    log::info!("[recover] submitting {} recovery txs", raws.len());
+    let hashes = submit_batch_and_confirm(rpc, &register_tx, raws).await?;
+    log::info!("[recover] {} accounts -> faucet", hashes.len());
+    Ok(())
+}
+
+async fn build_recover_tx(
+    mut account: Account,
+    rpc: RpcClient,
+    bench: config::BenchConfig,
+    faucet: Address,
+    gas: U256,
+    chain_id: u64,
+) -> Result<Option<Bytes>> {
+    let balance = account.balance(&rpc).await?;
+    if balance <= gas {
+        return Ok(None);
+    }
+    account.nonce = rpc.get_nonce(account.address).await?;
+    let signed = tx::build_native_tx(&account, faucet, balance - gas, &bench, chain_id).await?;
+    Ok(Some(signed.raw))
+}
+
+async fn submit_batch_and_confirm(
+    rpc: &RpcClient,
+    register_tx: &mpsc::Sender<MonitorCommand>,
+    raws: Vec<Bytes>,
+) -> Result<Vec<B256>> {
+    let expected_hashes: Vec<B256> = raws.iter().map(tx::raw_tx_hash).collect();
+    let confirmations = register_confirmations(register_tx, &expected_hashes).await?;
+    let hashes = rpc.batch_send_raw_txs(&raws).await?;
+    ensure_hashes_match(&expected_hashes, &hashes)?;
+    wait_confirmations(confirmations).await?;
+    Ok(hashes)
+}
+
+async fn register_confirmations(
+    register_tx: &mpsc::Sender<MonitorCommand>,
+    hashes: &[B256],
+) -> Result<Vec<(B256, oneshot::Receiver<bool>)>> {
+    let mut confirmations = Vec::with_capacity(hashes.len());
+    let mut registered_receivers = Vec::with_capacity(hashes.len());
+    for &hash in hashes {
+        let (reply, rx) = oneshot::channel();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        register_tx
+            .send(MonitorCommand::Register(RegisterTx {
+                hash,
+                reply,
+                registered: registered_tx,
+            }))
+            .await?;
+        registered_receivers.push(registered_rx);
+        confirmations.push((hash, rx));
+    }
+    for registered_rx in registered_receivers {
+        registered_rx.await?;
+    }
+    Ok(confirmations)
+}
+
+async fn wait_confirmations(confirmations: Vec<(B256, oneshot::Receiver<bool>)>) -> Result<()> {
+    for (hash, rx) in confirmations {
+        match rx.await {
+            Ok(true) => {}
+            Ok(false) => anyhow::bail!("tx 0x{} failed", hex::encode(hash.as_slice())),
+            Err(_) => anyhow::bail!(
+                "confirmation channel closed for tx 0x{}",
+                hex::encode(hash.as_slice())
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn ensure_hashes_match(expected: &[B256], actual: &[B256]) -> Result<()> {
+    if expected.len() != actual.len() {
+        anyhow::bail!(
+            "batch returned {} hashes for {} txs",
+            actual.len(),
+            expected.len()
+        );
+    }
+    for (i, (expected, actual)) in expected.iter().zip(actual.iter()).enumerate() {
+        if expected != actual {
+            anyhow::bail!(
+                "batch tx hash mismatch at {}: expected 0x{}, got 0x{}",
+                i,
+                hex::encode(expected.as_slice()),
+                hex::encode(actual.as_slice())
+            );
+        }
+    }
     Ok(())
 }
 
 async fn detect_chain_id(url: &str) -> Result<u64> {
-    let client = reqwest::Client::new();
-    let body = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "eth_chainId",
-        "params": [],
-        "id": 1
-    });
+    let body = serde_json::json!({"jsonrpc":"2.0","method":"eth_chainId","params":[],"id":1});
+    let client = reqwest::Client::builder().no_proxy().build()?;
     let resp: serde_json::Value = client.post(url).json(&body).send().await?.json().await?;
-    let hex_str = resp["result"].as_str().unwrap_or("0x0");
-    Ok(u64::from_str_radix(hex_str.trim_start_matches("0x"), 16)?)
+    Ok(u64::from_str_radix(
+        resp["result"]
+            .as_str()
+            .unwrap_or("0x0")
+            .trim_start_matches("0x"),
+        16,
+    )?)
 }

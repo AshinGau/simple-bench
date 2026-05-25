@@ -24,7 +24,8 @@ pub struct RpcConfig {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct BenchConfig {
     pub num_accounts: usize,
-    pub num_senders: usize,
+    pub rpc_concurrency: usize,
+    pub num_inflight_senders: usize,
     pub transfer_type: TransferType,
     pub max_fee_per_gas: u64,
     pub max_priority_fee_per_gas: u64,
@@ -52,6 +53,10 @@ where
 
         fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             f.write_str("ETH amount as number or string")
+        }
+
+        fn visit_i64<E: de::Error>(self, v: i64) -> Result<U256, E> {
+            Ok(U256::from(v as u128 * 1_000_000_000_000_000_000u128))
         }
 
         fn visit_u64<E: de::Error>(self, v: u64) -> Result<U256, E> {
@@ -92,6 +97,13 @@ pub fn derive_worker_keys(faucet_key: &str, num_accounts: usize) -> Vec<String> 
 impl Config {
     pub fn load<P: AsRef<Path>>(path: P) -> anyhow::Result<Self> {
         let content = std::fs::read_to_string(path.as_ref())?;
-        Ok(toml::from_str(&content)?)
+        let config: Self = toml::from_str(&content)?;
+        if config.bench.rpc_concurrency == 0 {
+            anyhow::bail!("bench.rpc_concurrency must be greater than 0");
+        }
+        if config.bench.num_inflight_senders == 0 {
+            anyhow::bail!("bench.num_inflight_senders must be greater than 0");
+        }
+        Ok(config)
     }
 }

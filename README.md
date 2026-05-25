@@ -40,7 +40,8 @@ url = "https://mainnet-rpc.gravity.xyz"
 
 [bench]
 num_accounts = 100           # 测试账户数
-num_senders = 50             # 最大并发未确认 tx 数
+rpc_concurrency = 32         # 全局 JSON-RPC HTTP 请求并发上限
+num_inflight_senders = 50    # 最大未上链确认 sender 数
 transfer_type = "native"     # "native" 或 "erc20"
 max_fee_per_gas = 50         # Gwei
 max_priority_fee_per_gas = 1 # Gwei
@@ -50,15 +51,16 @@ max_pool_size = 40000        # mempool pending 上限，超过则暂停发送
 
 ## 工作原理
 
-1. **启动**: faucet 向 num_accounts 个 worker 平均分发 ETH
-2. **压测**: 每个 worker 循环发交易，通过区块监控获取 receipt 确认上链后 nonce+1
-3. **流控**: monitor 每 100ms 检查 mempool size，超过 max_pool_size 则暂停发送
-4. **结束**: 所有 worker 余额不足时自动结束，输出统计
+1. **启动**: faucet 批量/并发提交初始化交易，然后通过区块监控确认上链
+2. **压测**: 每个 worker 循环发交易，最多 `num_inflight_senders` 个 sender 同时等待上链确认
+3. **RPC 流控**: 所有 JSON-RPC 请求共享 `rpc_concurrency` 并发上限，收到 RPC 回复后释放额度
+4. **Mempool 流控**: monitor 定期检查 mempool size，超过 `max_pool_size` 则暂停发送
+5. **结束**: 所有 worker 余额不足时自动结束，输出统计
 
 ### Receipt 监控
 
-- 默认模式: 匹配到 tx hash 出现在区块中即确认上链，不查 receipt
-- `--receipt` 模式: 额外 batch 拉取 receipt，区分 success/fail/revert
+- 默认模式: 通过区块 tx hash 匹配确认上链，不查 receipt
+- `--receipt` 模式: 对匹配到的 tx hash 额外 batch 拉取 receipt，区分 success/fail/revert
 
 两种模式下，nonce 均在 tx 被打包进区块后递增（无论成功或 revert）。
 

@@ -48,7 +48,7 @@ impl Stats {
         let failed = self.failed.load(Ordering::Relaxed);
         let tps = self.tps();
         log::info!(
-            "[运行] sent={} confirmed={} failed={} active={} TPS={:.1}",
+            "[stats] sent={} confirmed={} failed={} active={} tps={:.1}",
             sent,
             confirmed,
             failed,
@@ -62,13 +62,14 @@ impl Stats {
         let confirmed = self.confirmed.load(Ordering::Relaxed);
         let failed = self.failed.load(Ordering::Relaxed);
         let tps = self.tps();
+        let elapsed = self.elapsed_secs();
         log::info!(
-            "[统计] 总发送: {}, 确认: {}, 失败: {}, 平均TPS: {:.1}, 耗时: {:.1}s",
+            "[stats] FINAL sent={} confirmed={} failed={} tps={:.1} elapsed={:.1}s",
             sent,
             confirmed,
             failed,
             tps,
-            self.elapsed_secs()
+            elapsed
         );
     }
 }
