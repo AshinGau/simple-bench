@@ -19,6 +19,8 @@ use monitor::{MonitorCommand, RegisterTx};
 use rpc::RpcClient;
 use stats::Stats;
 
+const MAX_INIT_SENDER_INFLIGHT_TXS: usize = 60;
+
 #[derive(Parser)]
 #[command(name = "simple_bench")]
 struct Cli {
@@ -278,7 +280,7 @@ async fn distribute_funds(
         raws.push(signed.raw);
     }
 
-    let hashes = submit_batch_and_confirm(rpc, &register_tx, raws).await?;
+    let hashes = submit_sender_limited_batches(rpc, &register_tx, raws).await?;
     log::info!("[init] ETH sent to {} accounts", hashes.len());
     Ok(())
 }
@@ -305,7 +307,7 @@ async fn deploy_tokens(
         raws.push(signed.raw);
     }
 
-    submit_batch_and_confirm(rpc, &register_tx, raws).await?;
+    submit_sender_limited_batches(rpc, &register_tx, raws).await?;
     for (i, address) in addresses.iter().enumerate() {
         log::info!("[init] ERC20#{} deployed at 0x{:x}", i, address);
     }
@@ -350,7 +352,7 @@ async fn distribute_tokens(
         }
     }
 
-    let hashes = submit_batch_and_confirm(rpc, &register_tx, raws).await?;
+    let hashes = submit_sender_limited_batches(rpc, &register_tx, raws).await?;
     log::info!("[init] tokens distributed: {} txs", hashes.len());
     Ok(())
 }
@@ -441,6 +443,35 @@ async fn build_recover_tx(
     account.nonce = rpc.get_nonce(account.address).await?;
     let signed = tx::build_native_tx(&account, faucet, balance - gas, &bench, chain_id).await?;
     Ok(Some(signed.raw))
+}
+
+async fn submit_sender_limited_batches(
+    rpc: &RpcClient,
+    register_tx: &mpsc::Sender<MonitorCommand>,
+    raws: Vec<Bytes>,
+) -> Result<Vec<B256>> {
+    if raws.len() <= MAX_INIT_SENDER_INFLIGHT_TXS {
+        return submit_batch_and_confirm(rpc, register_tx, raws).await;
+    }
+
+    log::info!(
+        "[init] limiting single-sender inflight: {} txs in batches of {}",
+        raws.len(),
+        MAX_INIT_SENDER_INFLIGHT_TXS
+    );
+
+    let total_batches = raws.len().div_ceil(MAX_INIT_SENDER_INFLIGHT_TXS);
+    let mut hashes = Vec::with_capacity(raws.len());
+    for (idx, chunk) in raws.chunks(MAX_INIT_SENDER_INFLIGHT_TXS).enumerate() {
+        log::debug!(
+            "[init] submitting sender batch {}/{} txs={}",
+            idx + 1,
+            total_batches,
+            chunk.len()
+        );
+        hashes.extend(submit_batch_and_confirm(rpc, register_tx, chunk.to_vec()).await?);
+    }
+    Ok(hashes)
 }
 
 async fn submit_batch_and_confirm(
