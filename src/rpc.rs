@@ -164,6 +164,42 @@ impl RpcClient {
         let ordered = order_batch_responses(resp, raws.len())?;
         ordered.iter().map(|r| parse_b256(&r["result"])).collect()
     }
+
+    pub async fn batch_get_nonces(&self, addrs: &[Address]) -> Result<Vec<u64>> {
+        if addrs.is_empty() {
+            return Ok(vec![]);
+        }
+        let calls: Vec<Value> = addrs.iter().enumerate().map(|(i, addr)| {
+            json!({"jsonrpc":"2.0","method":"eth_getTransactionCount","params":[format!("0x{:x}", addr), "pending"],"id":i+1})
+        }).collect();
+        let resp: Vec<Value> = self.post_json(&calls).await?;
+        let ordered = order_batch_responses(resp, addrs.len())?;
+        ordered
+            .iter()
+            .map(|r| {
+                let s = r["result"].as_str().unwrap_or("0x0");
+                Ok(u64::from_str_radix(s.trim_start_matches("0x"), 16)?)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
+
+    pub async fn batch_get_balances(&self, addrs: &[Address]) -> Result<Vec<U256>> {
+        if addrs.is_empty() {
+            return Ok(vec![]);
+        }
+        let calls: Vec<Value> = addrs.iter().enumerate().map(|(i, addr)| {
+            json!({"jsonrpc":"2.0","method":"eth_getBalance","params":[format!("0x{:x}", addr), "latest"],"id":i+1})
+        }).collect();
+        let resp: Vec<Value> = self.post_json(&calls).await?;
+        let ordered = order_batch_responses(resp, addrs.len())?;
+        ordered
+            .iter()
+            .map(|r| {
+                let s = r["result"].as_str().unwrap_or("0x0");
+                Ok(U256::from_str_radix(s.trim_start_matches("0x"), 16)?)
+            })
+            .collect::<Result<Vec<_>>>()
+    }
 }
 
 fn parse_block_tx_hashes(block_num: u64, block: &Value) -> Result<Vec<B256>> {
@@ -198,20 +234,18 @@ fn order_batch_responses(resp: Vec<Value>, expected: usize) -> Result<Vec<Value>
         }
         let id = item
             .get("id")
-            .and_then(Value::as_u64)
-            .ok_or_else(|| anyhow::anyhow!("batch response missing id"))?;
-        if id == 0 || id as usize > expected {
-            anyhow::bail!("batch response id {} out of range", id);
+            .and_then(|id| id.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("missing id in batch response"))?;
+        if id < 1 || id as usize > expected {
+            anyhow::bail!("unexpected batch response id: {}", id);
         }
-        let slot = &mut ordered[id as usize - 1];
-        if slot.is_some() {
-            anyhow::bail!("duplicate batch response id {}", id);
-        }
-        *slot = Some(item);
+        ordered[(id - 1) as usize] = Some(item);
     }
     ordered
         .into_iter()
         .enumerate()
-        .map(|(i, item)| item.ok_or_else(|| anyhow::anyhow!("missing batch response id {}", i + 1)))
+        .map(|(i, v)| {
+            v.ok_or_else(|| anyhow::anyhow!("missing response for batch index {}", i + 1))
+        })
         .collect()
 }

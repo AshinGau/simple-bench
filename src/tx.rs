@@ -51,6 +51,30 @@ pub async fn build_native_tx(
     sign_and_encode(account, tx).await
 }
 
+/// Build and sign a native transfer with inline parameters (for bench worker).
+pub async fn build_native_tx_inline(
+    account: &Account,
+    to: Address,
+    value: U256,
+    max_fee_per_gas: u64,
+    max_priority_fee_per_gas: u64,
+    chain_id: u64,
+    gas_limit: u64,
+) -> Result<SignedTx> {
+    let tx = TxEip1559 {
+        chain_id,
+        nonce: account.nonce,
+        max_priority_fee_per_gas: max_priority_fee_per_gas as u128 * 1_000_000_000,
+        max_fee_per_gas: max_fee_per_gas as u128 * 1_000_000_000,
+        gas_limit,
+        to: alloy::primitives::TxKind::Call(to),
+        value,
+        access_list: Default::default(),
+        input: Bytes::new(),
+    };
+    sign_and_encode(account, tx).await
+}
+
 /// Build and sign an ERC20 transfer(address to, uint256 amount).
 pub async fn build_erc20_tx(
     account: &Account,

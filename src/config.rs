@@ -32,6 +32,12 @@ pub struct BenchConfig {
     #[serde(default)]
     pub num_tokens: usize,
     pub max_pool_size: u64,
+    #[serde(default = "default_rpc_batch_size")]
+    pub rpc_batch_size: usize,
+    #[serde(default = "default_faucet_level")]
+    pub faucet_level: usize,
+    #[serde(default, deserialize_with = "from_opt_eth_to_u256")]
+    pub faucet_eth_per_level: Option<U256>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -39,6 +45,14 @@ pub struct BenchConfig {
 pub enum TransferType {
     Native,
     Erc20,
+}
+
+fn default_rpc_batch_size() -> usize {
+    64
+}
+
+fn default_faucet_level() -> usize {
+    10
 }
 
 /// Parse ETH amount (number or string) to wei.
@@ -76,6 +90,14 @@ where
     deserializer.deserialize_any(EthVisitor)
 }
 
+fn from_opt_eth_to_u256<'de, D>(deserializer: D) -> Result<Option<U256>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let v: Option<f64> = Option::deserialize(deserializer)?;
+    Ok(v.map(|eth| U256::from((eth * 1e18) as u128)))
+}
+
 /// Derive num_accounts deterministic private keys from faucet key.
 pub fn derive_worker_keys(faucet_key: &str, num_accounts: usize) -> Vec<String> {
     let base = faucet_key.trim_start_matches("0x");
@@ -92,6 +114,33 @@ pub fn derive_worker_keys(faucet_key: &str, num_accounts: usize) -> Vec<String> 
         keys.push(format!("0x{}", hex::encode(&key_bytes)));
     }
     keys
+}
+
+/// Derive faucet_level intermediate account keys (XOR first 4 bytes, orthogonal to worker keys).
+pub fn derive_intermediate_keys(faucet_key: &str, level: usize) -> Vec<String> {
+    let base = faucet_key.trim_start_matches("0x");
+    let base_bytes = hex::decode(base).expect("invalid faucet private key");
+    let mut keys = Vec::with_capacity(level);
+    for i in 0..level {
+        let mut key_bytes = base_bytes.clone();
+        let idx = (i as u32).to_be_bytes();
+        for j in 0..4 {
+            key_bytes[j] ^= idx[j];
+        }
+        keys.push(format!("0x{}", hex::encode(&key_bytes)));
+    }
+    keys
+}
+
+impl BenchConfig {
+    pub fn faucet_eth_per_level_or_default(&self, faucet_eth_balance: U256) -> U256 {
+        self.faucet_eth_per_level
+            .unwrap_or_else(|| faucet_eth_balance / U256::from(self.faucet_level))
+    }
+
+    pub fn clamped_faucet_level(&self) -> usize {
+        self.faucet_level.min(self.num_accounts)
+    }
 }
 
 impl Config {

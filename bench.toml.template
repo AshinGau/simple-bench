@@ -1,16 +1,18 @@
 [faucet]
 private_key = "0x..."
-faucet_eth_balance = 500
+faucet_eth_balance = 600
 
 [rpc]
-url = "https://mainnet-rpc.gravity.xyz"
+url = "http://34.66.62.28:8545"
 
 [bench]
-num_accounts = 100
-rpc_concurrency = 32
-num_inflight_senders = 50
+num_accounts = 500
+rpc_concurrency = 64
+num_inflight_senders = 400
 transfer_type = "erc20"
 max_fee_per_gas = 60
 max_priority_fee_per_gas = 1
 num_tokens = 2
 max_pool_size = 40000
+rpc_batch_size = 64
+faucet_level = 10
