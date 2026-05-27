@@ -412,7 +412,7 @@ async fn run_faucet(
     // === Phase 2: ERC20 ===
     if config.bench.transfer_type == TransferType::Erc20 {
         let bytecode = tx::simple_token_bytecode();
-        let supply = U256::from(1_000_000_000u64) * U256::from(10u64.pow(18));
+        let supply = U256::MAX;
         let token_per_worker = U256::from(1_000_000u64) * U256::from(10u64.pow(18));
 
         // 2a: master deploy + transfer to intermediates
