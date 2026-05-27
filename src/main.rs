@@ -5,6 +5,7 @@ mod rpc;
 mod stats;
 mod tx;
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -14,7 +15,9 @@ use clap::Parser;
 use tokio::sync::{mpsc, oneshot};
 
 use account::Account;
-use config::{Config, TransferType};
+use config::{
+    BenchConfig, Config, TransferType, ERC20_TRANSFER_GAS_LIMIT, NATIVE_TRANSFER_GAS_LIMIT,
+};
 use monitor::{MonitorCommand, RegisterTx, TxReceipt};
 use rpc::RpcClient;
 use stats::Stats;
@@ -174,6 +177,101 @@ async fn detect_chain_id(url: &str) -> Result<u64> {
     )?)
 }
 
+fn derive_bench_recipient(account: &Account) -> Address {
+    let mut input = [0u8; 28];
+    input[..20].copy_from_slice(account.address.as_slice());
+    input[20..].copy_from_slice(&account.nonce.to_be_bytes());
+    let hash = alloy::primitives::keccak256(input);
+    Address::from_slice(&hash[12..])
+}
+
+fn validate_derived_accounts(
+    faucet: Address,
+    workers: &[Account],
+    intermediates: &[Account],
+) -> Result<()> {
+    if workers.iter().any(|account| account.address == faucet) {
+        anyhow::bail!("derived worker set contains faucet address 0x{:x}", faucet);
+    }
+    if intermediates
+        .iter()
+        .any(|account| account.address == faucet)
+    {
+        anyhow::bail!(
+            "derived intermediate set contains faucet address 0x{:x}",
+            faucet
+        );
+    }
+
+    let worker_set: HashSet<_> = workers.iter().map(|account| account.address).collect();
+    if worker_set.len() != workers.len() {
+        anyhow::bail!("derived worker set contains duplicate addresses");
+    }
+    let intermediate_set: HashSet<_> = intermediates
+        .iter()
+        .map(|account| account.address)
+        .collect();
+    if intermediate_set.len() != intermediates.len() {
+        anyhow::bail!("derived intermediate set contains duplicate addresses");
+    }
+    if !worker_set.is_disjoint(&intermediate_set) {
+        anyhow::bail!("worker and intermediate sets overlap");
+    }
+    Ok(())
+}
+
+fn intermediate_gas_reserve(bench: &BenchConfig, worker_count: usize) -> U256 {
+    let worker_count = U256::from(worker_count);
+    let native_reserve =
+        Account::estimated_gas_cost(bench.max_fee_per_gas, NATIVE_TRANSFER_GAS_LIMIT)
+            * worker_count;
+    let erc20_reserve = if bench.transfer_type == TransferType::Erc20 {
+        Account::estimated_gas_cost(bench.max_fee_per_gas, ERC20_TRANSFER_GAS_LIMIT)
+            * worker_count
+            * U256::from(bench.num_tokens)
+    } else {
+        U256::ZERO
+    };
+    native_reserve + erc20_reserve
+}
+
+fn worker_subset(workers: &[Account], chunk_size: usize, idx: usize) -> Vec<Account> {
+    workers.chunks(chunk_size).nth(idx).unwrap_or(&[]).to_vec()
+}
+
+async fn discover_erc20_token_addresses(
+    config: &Config,
+    rpc: &RpcClient,
+) -> Result<Arc<[Address]>> {
+    let faucet = Account::from_key(&config.faucet.private_key)?;
+    let faucet_nonce = rpc.get_nonce(faucet.address).await?;
+    let level = config.bench.clamped_faucet_level() as u64;
+    let deploy_span = (config.bench.num_tokens as u64)
+        .checked_mul(level + 1)
+        .ok_or_else(|| anyhow::anyhow!("erc20 token recovery span overflow"))?;
+    let deploy_start_nonce = faucet_nonce.checked_sub(deploy_span).ok_or_else(|| {
+        anyhow::anyhow!(
+            "faucet nonce {} is too small to recover {} ERC20 deployments; run faucet first with matching config",
+            faucet_nonce,
+            config.bench.num_tokens
+        )
+    })?;
+
+    let token_addresses: Vec<Address> = (0..config.bench.num_tokens)
+        .map(|i| tx::create_address(faucet.address, deploy_start_nonce + i as u64))
+        .collect();
+    let has_code = rpc.batch_has_code(&token_addresses).await?;
+    for (token, has_code) in token_addresses.iter().zip(has_code) {
+        if !has_code {
+            anyhow::bail!(
+                "no contract code at derived token address 0x{:x}; run faucet first with matching erc20 config",
+                token
+            );
+        }
+    }
+    Ok(Arc::<[Address]>::from(token_addresses))
+}
+
 // ── submit_raws_async ──────────────────────────────────────────────
 
 /// Batch 发送 raws，注册 monitor，返回 confirmation receivers。
@@ -238,6 +336,8 @@ async fn run_faucet(
         .map(|k| Account::from_key(k))
         .collect::<Result<_>>()?;
 
+    validate_derived_accounts(faucet.address, &workers, &intermediates)?;
+
     log::info!(
         "[faucet] {} workers, faucet_level={}, eth_per_inter={} wei",
         workers.len(),
@@ -252,8 +352,8 @@ async fn run_faucet(
     for (i, inter) in intermediates.iter().enumerate() {
         let mut s = faucet.clone();
         s.nonce = master_nonce + i as u64;
-        let signed = tx::build_native_tx(&s, inter.address, eth_per_inter, &config.bench, chain_id)
-            .await?;
+        let signed =
+            tx::build_native_tx(&s, inter.address, eth_per_inter, &config.bench, chain_id).await?;
         raws_1a.push(signed.raw);
     }
     submit_with_inflight_limit(rpc, &register_tx, &raws_1a, rpc_batch).await?;
@@ -265,17 +365,28 @@ async fn run_faucet(
     let chunk_size = workers.len().div_ceil(level);
     let mut handles = Vec::new();
     for (idx, inter) in intermediates.iter().enumerate() {
-        let subset: Vec<Account> = workers
-            .chunks(chunk_size)
-            .nth(idx)
-            .unwrap_or(&[])
-            .iter()
-            .cloned()
-            .collect();
+        let subset = worker_subset(&workers, chunk_size, idx);
         if subset.is_empty() {
             continue;
         }
-        let eth_per_worker = eth_per_inter / U256::from(subset.len());
+        let gas_reserve = intermediate_gas_reserve(&config.bench, subset.len());
+        if eth_per_inter <= gas_reserve {
+            anyhow::bail!(
+                "intermediate allocation {} wei does not cover required gas reserve {} wei for {} workers",
+                eth_per_inter,
+                gas_reserve,
+                subset.len()
+            );
+        }
+        let distributable = eth_per_inter - gas_reserve;
+        let eth_per_worker = distributable / U256::from(subset.len());
+        if eth_per_worker.is_zero() {
+            anyhow::bail!(
+                "intermediate allocation {} wei leaves zero worker funding after reserving {} wei gas",
+                eth_per_inter,
+                gas_reserve
+            );
+        }
         let base_nonce = inter_nonces[idx];
         let mut s_inter = inter.clone();
         let rpc = rpc.clone();
@@ -286,7 +397,8 @@ async fn run_faucet(
             for (j, w) in subset.iter().enumerate() {
                 s_inter.nonce = base_nonce + j as u64;
                 let signed =
-                    tx::build_native_tx(&s_inter, w.address, eth_per_worker, &bench, chain_id).await?;
+                    tx::build_native_tx(&s_inter, w.address, eth_per_worker, &bench, chain_id)
+                        .await?;
                 raws.push(signed.raw);
             }
             submit_with_inflight_limit(&rpc, &register_tx, &raws, rpc_batch).await
@@ -317,12 +429,13 @@ async fn run_faucet(
                 tx::build_deploy_tx(&s, &bytecode, supply, &config.bench, chain_id).await?;
             raws_2a.push(signed.raw);
         }
+        let token_addresses = Arc::<[Address]>::from(token_addresses);
 
         // Transfer tokens to intermediates
         let token_per_inter = supply / U256::from(level);
         let base_nonce = master_nonce + config.bench.num_tokens as u64;
         let mut nonce_offset = 0u64;
-        for token_addr in &token_addresses {
+        for token_addr in token_addresses.iter() {
             for inter in &intermediates {
                 let mut s = faucet.clone();
                 s.nonce = base_nonce + nonce_offset;
@@ -370,7 +483,7 @@ async fn run_faucet(
             handles2.push(tokio::spawn(async move {
                 let mut raws = Vec::new();
                 let mut nonce = base_nonce;
-                for token_addr in &tokens {
+                for token_addr in tokens.iter() {
                     for w in &subset {
                         s_inter.nonce = nonce;
                         nonce += 1;
@@ -413,9 +526,9 @@ async fn spawn_batch_sender(
     stop: Arc<AtomicBool>,
     rpc_batch_size: usize,
 ) {
+    let flush_interval = tokio::time::Duration::from_millis(5);
     let mut buf: Vec<BatchTx> = Vec::new();
     loop {
-        // Collect until we have enough or stop
         let should_flush = loop {
             if buf.len() >= rpc_batch_size {
                 break true;
@@ -423,12 +536,17 @@ async fn spawn_batch_sender(
             if stop.load(Ordering::Relaxed) && !buf.is_empty() {
                 break true;
             }
-            match rx.recv().await {
-                Some(tx) => buf.push(tx),
-                None => {
-                    // Channel closed, flush remaining
-                    break !buf.is_empty();
+            if buf.is_empty() {
+                match rx.recv().await {
+                    Some(tx) => buf.push(tx),
+                    None => break false,
                 }
+                continue;
+            }
+            match tokio::time::timeout(flush_interval, rx.recv()).await {
+                Ok(Some(tx)) => buf.push(tx),
+                Ok(None) => break true,
+                Err(_) => break true,
             }
         };
 
@@ -437,16 +555,13 @@ async fn spawn_batch_sender(
         }
 
         let batch: Vec<Bytes> = buf.iter().map(|t| t.raw.clone()).collect();
-        let _expected: Vec<B256> = buf.iter().map(|t| t.expected_hash).collect();
         match rpc.batch_send_raw_txs(&batch).await {
             Ok(returned) => {
                 for (i, bt) in buf.drain(..).enumerate() {
                     if i < returned.len() && returned[i] == bt.expected_hash {
                         let _ = bt.reply.send(Ok(returned[i]));
                     } else {
-                        let _ = bt
-                            .reply
-                            .send(Err(anyhow::anyhow!("hash mismatch")));
+                        let _ = bt.reply.send(Err(anyhow::anyhow!("hash mismatch")));
                     }
                 }
             }
@@ -461,7 +576,6 @@ async fn spawn_batch_sender(
         }
 
         if stop.load(Ordering::Relaxed) {
-            // Drain remaining
             while let Ok(bt) = rx.try_recv() {
                 let _ = bt.reply.send(Err(anyhow::anyhow!("stopped")));
             }
@@ -473,12 +587,70 @@ async fn spawn_batch_sender(
 // ── run_bench ──────────────────────────────────────────────────────
 
 #[derive(Clone)]
+enum BenchWorkload {
+    Native,
+    Erc20 { token_addresses: Arc<[Address]> },
+}
+
+#[derive(Clone)]
 struct BenchCfg {
-    transfer_type: TransferType,
-    max_fee_per_gas: u64,
-    max_priority_fee_per_gas: u64,
+    workload: BenchWorkload,
+    fee_config: tx::TxFeeConfig,
     max_pool_size: u64,
+    amount: U256,
+    receipt_value: U256,
     gas_limit: u64,
+}
+
+impl BenchCfg {
+    fn from_config(config: &BenchConfig, token_addresses: Arc<[Address]>) -> Self {
+        let workload = match config.transfer_type {
+            TransferType::Native => BenchWorkload::Native,
+            TransferType::Erc20 => BenchWorkload::Erc20 { token_addresses },
+        };
+        Self {
+            workload,
+            fee_config: tx::TxFeeConfig::from(config),
+            max_pool_size: config.max_pool_size,
+            amount: config.transfer_amount(),
+            receipt_value: config.transfer_native_value(),
+            gas_limit: config.transfer_gas_limit(),
+        }
+    }
+
+    fn estimated_gas(&self) -> U256 {
+        Account::estimated_gas_cost(self.fee_config.max_fee_per_gas, self.gas_limit)
+    }
+
+    async fn build_tx(&self, account: &Account, chain_id: u64) -> Result<tx::SignedTx> {
+        let to = derive_bench_recipient(account);
+        match &self.workload {
+            BenchWorkload::Native => {
+                tx::build_native_transfer(
+                    account,
+                    to,
+                    self.amount,
+                    self.fee_config,
+                    chain_id,
+                    self.gas_limit,
+                )
+                .await
+            }
+            BenchWorkload::Erc20 { token_addresses } => {
+                let token = token_addresses[account.nonce as usize % token_addresses.len()];
+                tx::build_erc20_transfer(
+                    account,
+                    token,
+                    to,
+                    self.amount,
+                    self.fee_config,
+                    chain_id,
+                    self.gas_limit,
+                )
+                .await
+            }
+        }
+    }
 }
 
 async fn run_bench(
@@ -504,10 +676,12 @@ async fn run_bench(
         account.balance = balances[i];
     }
 
-    let gas_limit = if config.bench.transfer_type == TransferType::Native {
-        21000
+    let token_addresses = if config.bench.transfer_type == TransferType::Erc20 {
+        let tokens = discover_erc20_token_addresses(config, rpc).await?;
+        log::info!("[bench] recovered {} ERC20 token addresses", tokens.len());
+        tokens
     } else {
-        100000
+        Arc::<[Address]>::from(Vec::new())
     };
 
     log::info!(
@@ -546,13 +720,7 @@ async fn run_bench(
         });
     }
 
-    let bench_cfg = BenchCfg {
-        transfer_type: config.bench.transfer_type.clone(),
-        max_fee_per_gas: config.bench.max_fee_per_gas,
-        max_priority_fee_per_gas: config.bench.max_priority_fee_per_gas,
-        max_pool_size: config.bench.max_pool_size,
-        gas_limit,
-    };
+    let bench_cfg = BenchCfg::from_config(&config.bench, token_addresses);
 
     let mut handles = Vec::new();
     for (idx, account) in accounts.into_iter().enumerate() {
@@ -561,7 +729,6 @@ async fn run_bench(
             account,
             chain_id,
             bench_cfg.clone(),
-            rpc.clone(),
             stats.clone(),
             pool_size.clone(),
             register_tx.clone(),
@@ -586,7 +753,6 @@ async fn run_bench_worker(
     mut account: Account,
     chain_id: u64,
     bench_cfg: BenchCfg,
-    _rpc: RpcClient,
     stats: Arc<Stats>,
     pool_size: Arc<AtomicU64>,
     register_tx: mpsc::Sender<MonitorCommand>,
@@ -595,8 +761,7 @@ async fn run_bench_worker(
     stop: Arc<AtomicBool>,
     num_accounts: usize,
 ) {
-    let value = U256::from(1);
-    let estimated_gas = Account::estimated_gas_cost(bench_cfg.max_fee_per_gas, bench_cfg.gas_limit);
+    let estimated_gas = bench_cfg.estimated_gas();
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -615,34 +780,10 @@ async fn run_bench_worker(
             break;
         }
 
-        // Build tx
-        let signed = match bench_cfg.transfer_type {
-            TransferType::Native => {
-                let to = Address::from_slice(
-                    &alloy::primitives::keccak256(
-                        [account.address.as_slice(), &account.nonce.to_be_bytes()].concat(),
-                    )[12..],
-                );
-                match tx::build_native_tx_inline(
-                    &account,
-                    to,
-                    value,
-                    bench_cfg.max_fee_per_gas,
-                    bench_cfg.max_priority_fee_per_gas,
-                    chain_id,
-                    21000,
-                )
-                .await
-                {
-                    Ok(s) => s,
-                    Err(e) => {
-                        log::error!("[worker#{}] build_tx: {}", idx, e);
-                        break;
-                    }
-                }
-            }
-            TransferType::Erc20 => {
-                log::error!("[worker#{}] ERC20 bench not yet supported", idx);
+        let signed = match bench_cfg.build_tx(&account, chain_id).await {
+            Ok(signed) => signed,
+            Err(e) => {
+                log::error!("[worker#{}] build_tx: {}", idx, e);
                 break;
             }
         };
@@ -696,7 +837,7 @@ async fn run_bench_worker(
             Err(_) => break,
         };
 
-        account.apply_receipt(&receipt, value);
+        account.apply_receipt(&receipt, bench_cfg.receipt_value);
 
         if receipt.success {
             stats.inc_confirmed();
@@ -721,9 +862,7 @@ async fn run_recover(
     register_tx: mpsc::Sender<MonitorCommand>,
 ) -> Result<()> {
     let faucet = account::faucet_address(&config.faucet.private_key)?;
-    let gas = U256::from(config.bench.max_fee_per_gas)
-        * U256::from(21000)
-        * U256::from(1_000_000_000u64);
+    let gas = Account::estimated_gas_cost(config.bench.max_fee_per_gas, NATIVE_TRANSFER_GAS_LIMIT);
 
     let worker_keys =
         config::derive_worker_keys(&config.faucet.private_key, config.bench.num_accounts);
@@ -762,8 +901,7 @@ async fn run_recover(
             let nonce = rpc.get_nonce(account.address).await?;
             let mut acc = account;
             acc.nonce = nonce;
-            let signed =
-                tx::build_native_tx(&acc, faucet, balance - gas, &bench, chain_id).await?;
+            let signed = tx::build_native_tx(&acc, faucet, balance - gas, &bench, chain_id).await?;
             Ok(Some(signed.raw))
         });
     }
@@ -805,8 +943,7 @@ async fn run_recover(
     }
     log::info!("[recover] submitting {} recovery txs", raws.len());
 
-    let (_, c) =
-        submit_raws_async(rpc, &register_tx, &raws, config.bench.rpc_batch_size).await?;
+    let (_, c) = submit_raws_async(rpc, &register_tx, &raws, config.bench.rpc_batch_size).await?;
     wait_confirmations(c).await?;
     log::info!("[recover] {} accounts → faucet", raws.len());
     Ok(())

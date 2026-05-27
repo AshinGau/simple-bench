@@ -8,16 +8,14 @@ use std::time::Duration;
 #[derive(Clone)]
 pub struct RpcClient {
     pub url: String,
-    pub chain_id: u64,
     client: reqwest::Client,
     rpc_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl RpcClient {
-    pub fn new(url: &str, chain_id: u64, rpc_concurrency: usize) -> Self {
+    pub fn new(url: &str, _chain_id: u64, rpc_concurrency: usize) -> Self {
         Self {
             url: url.to_string(),
-            chain_id,
             client: reqwest::Client::builder()
                 .no_proxy()
                 .timeout(Duration::from_secs(10))
@@ -130,6 +128,31 @@ impl RpcClient {
         )?)
     }
 
+    pub async fn batch_has_code(&self, addrs: &[Address]) -> Result<Vec<bool>> {
+        if addrs.is_empty() {
+            return Ok(vec![]);
+        }
+        let calls: Vec<Value> = addrs
+            .iter()
+            .enumerate()
+            .map(|(i, addr)| {
+                json!({"jsonrpc":"2.0","method":"eth_getCode","params":[format!("0x{:x}", addr), "latest"],"id":i+1})
+            })
+            .collect();
+        let resp: Vec<Value> = self.post_json(&calls).await?;
+        let ordered = order_batch_responses(resp, addrs.len())?;
+        Ok(ordered
+            .iter()
+            .map(|r| {
+                !r["result"]
+                    .as_str()
+                    .unwrap_or("0x")
+                    .trim_start_matches("0x")
+                    .is_empty()
+            })
+            .collect())
+    }
+
     pub async fn get_nonce(&self, addr: Address) -> Result<u64> {
         let r = self
             .call(
@@ -141,16 +164,6 @@ impl RpcClient {
             r.as_str().unwrap_or("0x0").trim_start_matches("0x"),
             16,
         )?)
-    }
-
-    pub async fn send_raw_tx(&self, raw: &Bytes) -> Result<B256> {
-        let r = self
-            .call(
-                "eth_sendRawTransaction",
-                json!([format!("0x{}", hex::encode(raw))]),
-            )
-            .await?;
-        parse_b256(&r)
     }
 
     pub async fn batch_send_raw_txs(&self, raws: &[Bytes]) -> Result<Vec<B256>> {

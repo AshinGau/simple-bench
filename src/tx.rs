@@ -5,17 +5,36 @@ use alloy::signers::Signer;
 use anyhow::Result;
 
 use crate::account::Account;
-use crate::config::BenchConfig;
+use crate::config::{
+    BenchConfig, ERC20_DEPLOY_GAS_LIMIT, ERC20_TRANSFER_GAS_LIMIT, NATIVE_TRANSFER_GAS_LIMIT,
+};
 
 pub struct SignedTx {
     pub raw: Bytes,
 }
 
-fn gas_prices(config: &BenchConfig) -> (u128, u128) {
-    (
-        config.max_priority_fee_per_gas as u128 * 1_000_000_000,
-        config.max_fee_per_gas as u128 * 1_000_000_000,
-    )
+#[derive(Clone, Copy)]
+pub struct TxFeeConfig {
+    pub max_priority_fee_per_gas: u64,
+    pub max_fee_per_gas: u64,
+}
+
+impl TxFeeConfig {
+    fn gas_prices(self) -> (u128, u128) {
+        (
+            self.max_priority_fee_per_gas as u128 * 1_000_000_000,
+            self.max_fee_per_gas as u128 * 1_000_000_000,
+        )
+    }
+}
+
+impl From<&BenchConfig> for TxFeeConfig {
+    fn from(config: &BenchConfig) -> Self {
+        Self {
+            max_priority_fee_per_gas: config.max_priority_fee_per_gas,
+            max_fee_per_gas: config.max_fee_per_gas,
+        }
+    }
 }
 
 async fn sign_and_encode(account: &Account, tx: TxEip1559) -> Result<SignedTx> {
@@ -36,36 +55,32 @@ pub async fn build_native_tx(
     config: &BenchConfig,
     chain_id: u64,
 ) -> Result<SignedTx> {
-    let (max_prio_wei, max_fee_wei) = gas_prices(config);
+    build_native_transfer(
+        account,
+        to,
+        value,
+        TxFeeConfig::from(config),
+        chain_id,
+        NATIVE_TRANSFER_GAS_LIMIT,
+    )
+    .await
+}
+
+/// Build and sign a native transfer with explicit fee config.
+pub async fn build_native_transfer(
+    account: &Account,
+    to: Address,
+    value: U256,
+    fee_config: TxFeeConfig,
+    chain_id: u64,
+    gas_limit: u64,
+) -> Result<SignedTx> {
+    let (max_prio_wei, max_fee_wei) = fee_config.gas_prices();
     let tx = TxEip1559 {
         chain_id,
         nonce: account.nonce,
         max_priority_fee_per_gas: max_prio_wei,
         max_fee_per_gas: max_fee_wei,
-        gas_limit: 21000,
-        to: alloy::primitives::TxKind::Call(to),
-        value,
-        access_list: Default::default(),
-        input: Bytes::new(),
-    };
-    sign_and_encode(account, tx).await
-}
-
-/// Build and sign a native transfer with inline parameters (for bench worker).
-pub async fn build_native_tx_inline(
-    account: &Account,
-    to: Address,
-    value: U256,
-    max_fee_per_gas: u64,
-    max_priority_fee_per_gas: u64,
-    chain_id: u64,
-    gas_limit: u64,
-) -> Result<SignedTx> {
-    let tx = TxEip1559 {
-        chain_id,
-        nonce: account.nonce,
-        max_priority_fee_per_gas: max_priority_fee_per_gas as u128 * 1_000_000_000,
-        max_fee_per_gas: max_fee_per_gas as u128 * 1_000_000_000,
         gas_limit,
         to: alloy::primitives::TxKind::Call(to),
         value,
@@ -84,7 +99,27 @@ pub async fn build_erc20_tx(
     config: &BenchConfig,
     chain_id: u64,
 ) -> Result<SignedTx> {
-    // transfer(address,uint256) selector = 0xa9059cbb
+    build_erc20_transfer(
+        account,
+        token,
+        to,
+        amount,
+        TxFeeConfig::from(config),
+        chain_id,
+        ERC20_TRANSFER_GAS_LIMIT,
+    )
+    .await
+}
+
+pub async fn build_erc20_transfer(
+    account: &Account,
+    token: Address,
+    to: Address,
+    amount: U256,
+    fee_config: TxFeeConfig,
+    chain_id: u64,
+    gas_limit: u64,
+) -> Result<SignedTx> {
     let mut data = Vec::with_capacity(68);
     data.extend_from_slice(&[0xa9, 0x05, 0x9c, 0xbb]);
     let mut addr_padded = [0u8; 32];
@@ -92,13 +127,13 @@ pub async fn build_erc20_tx(
     data.extend_from_slice(&addr_padded);
     data.extend_from_slice(&amount.to_be_bytes::<32>());
 
-    let (max_prio_wei, max_fee_wei) = gas_prices(config);
+    let (max_prio_wei, max_fee_wei) = fee_config.gas_prices();
     let tx = TxEip1559 {
         chain_id,
         nonce: account.nonce,
         max_priority_fee_per_gas: max_prio_wei,
         max_fee_per_gas: max_fee_wei,
-        gas_limit: 100000,
+        gas_limit,
         to: alloy::primitives::TxKind::Call(token),
         value: U256::ZERO,
         access_list: Default::default(),
@@ -118,13 +153,13 @@ pub async fn build_deploy_tx(
     let mut deploy_data = bytecode.to_vec();
     deploy_data.extend_from_slice(&initial_supply.to_be_bytes::<32>());
 
-    let (max_prio_wei, max_fee_wei) = gas_prices(config);
+    let (max_prio_wei, max_fee_wei) = TxFeeConfig::from(config).gas_prices();
     let tx = TxEip1559 {
         chain_id,
         nonce: account.nonce,
         max_priority_fee_per_gas: max_prio_wei,
         max_fee_per_gas: max_fee_wei,
-        gas_limit: 1500000,
+        gas_limit: ERC20_DEPLOY_GAS_LIMIT,
         to: alloy::primitives::TxKind::Create,
         value: U256::ZERO,
         access_list: Default::default(),

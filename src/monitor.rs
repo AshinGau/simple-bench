@@ -10,7 +10,6 @@ use crate::rpc::RpcClient;
 
 pub enum MonitorCommand {
     Register(RegisterTx),
-    Cancel(B256),
 }
 
 pub struct RegisterTx {
@@ -130,7 +129,6 @@ impl BlockMonitor {
 
     fn drain_registrations(&mut self) {
         let mut registered = 0;
-        let mut canceled = 0;
         while let Ok(cmd) = self.register_rx.try_recv() {
             match cmd {
                 MonitorCommand::Register(reg) => {
@@ -138,18 +136,12 @@ impl BlockMonitor {
                     let _ = reg.registered.send(());
                     registered += 1;
                 }
-                MonitorCommand::Cancel(hash) => {
-                    if self.pending.remove(&hash).is_some() {
-                        canceled += 1;
-                    }
-                }
             }
         }
-        if registered > 0 || canceled > 0 {
+        if registered > 0 {
             log::debug!(
-                "[monitor] registered={} canceled={} pending={}",
+                "[monitor] registered={} pending={}",
                 registered,
-                canceled,
                 self.pending.len()
             );
         }

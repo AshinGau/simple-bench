@@ -55,6 +55,10 @@ fn default_faucet_level() -> usize {
     10
 }
 
+pub const NATIVE_TRANSFER_GAS_LIMIT: u64 = 21_000;
+pub const ERC20_TRANSFER_GAS_LIMIT: u64 = 100_000;
+pub const ERC20_DEPLOY_GAS_LIMIT: u64 = 1_500_000;
+
 /// Parse ETH amount (number or string) to wei.
 fn from_eth_to_u256<'de, D>(deserializer: D) -> Result<U256, D::Error>
 where
@@ -100,36 +104,36 @@ where
 
 /// Derive num_accounts deterministic private keys from faucet key.
 pub fn derive_worker_keys(faucet_key: &str, num_accounts: usize) -> Vec<String> {
+    derive_xored_keys(faucet_key, num_accounts, false)
+}
+
+/// Derive faucet_level intermediate account keys (XOR first 4 bytes, orthogonal to worker keys).
+pub fn derive_intermediate_keys(faucet_key: &str, level: usize) -> Vec<String> {
+    derive_xored_keys(faucet_key, level, true)
+}
+
+fn derive_xored_keys(faucet_key: &str, count: usize, xor_prefix: bool) -> Vec<String> {
     let base = faucet_key.trim_start_matches("0x");
     let base_bytes = hex::decode(base).expect("invalid faucet private key");
-    let mut keys = Vec::with_capacity(num_accounts);
-    for i in 0..num_accounts {
+    let mut keys = Vec::with_capacity(count);
+    for i in 0..count {
         let mut key_bytes = base_bytes.clone();
-        // XOR last 4 bytes with index to create deterministic but unique keys
-        let idx = (i as u32).to_be_bytes();
-        let len = key_bytes.len();
+        let idx = key_derivation_index(i).to_be_bytes();
+        let start = if xor_prefix { 0 } else { key_bytes.len() - 4 };
         for j in 0..4 {
-            key_bytes[len - 4 + j] ^= idx[j];
+            key_bytes[start + j] ^= idx[j];
         }
         keys.push(format!("0x{}", hex::encode(&key_bytes)));
     }
     keys
 }
 
-/// Derive faucet_level intermediate account keys (XOR first 4 bytes, orthogonal to worker keys).
-pub fn derive_intermediate_keys(faucet_key: &str, level: usize) -> Vec<String> {
-    let base = faucet_key.trim_start_matches("0x");
-    let base_bytes = hex::decode(base).expect("invalid faucet private key");
-    let mut keys = Vec::with_capacity(level);
-    for i in 0..level {
-        let mut key_bytes = base_bytes.clone();
-        let idx = (i as u32).to_be_bytes();
-        for j in 0..4 {
-            key_bytes[j] ^= idx[j];
-        }
-        keys.push(format!("0x{}", hex::encode(&key_bytes)));
+fn key_derivation_index(i: usize) -> u32 {
+    if i == 0 {
+        u32::MAX
+    } else {
+        i as u32
     }
-    keys
 }
 
 impl BenchConfig {
@@ -140,6 +144,24 @@ impl BenchConfig {
 
     pub fn clamped_faucet_level(&self) -> usize {
         self.faucet_level.min(self.num_accounts)
+    }
+
+    pub fn transfer_gas_limit(&self) -> u64 {
+        match self.transfer_type {
+            TransferType::Native => NATIVE_TRANSFER_GAS_LIMIT,
+            TransferType::Erc20 => ERC20_TRANSFER_GAS_LIMIT,
+        }
+    }
+
+    pub fn transfer_amount(&self) -> U256 {
+        U256::from(1)
+    }
+
+    pub fn transfer_native_value(&self) -> U256 {
+        match self.transfer_type {
+            TransferType::Native => self.transfer_amount(),
+            TransferType::Erc20 => U256::ZERO,
+        }
     }
 }
 
@@ -153,6 +175,40 @@ impl Config {
         if config.bench.num_inflight_senders == 0 {
             anyhow::bail!("bench.num_inflight_senders must be greater than 0");
         }
+        if config.bench.transfer_type == TransferType::Erc20 && config.bench.num_tokens == 0 {
+            anyhow::bail!("bench.num_tokens must be greater than 0 when transfer_type=erc20");
+        }
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+
+    use super::{derive_intermediate_keys, derive_worker_keys};
+
+    const FAUCET_KEY: &str = "0xa276f0bd98df14e4f795e38f25fd5424f07b7f57d0cadb09a7203b5fca723bdc";
+
+    #[test]
+    fn worker_keys_do_not_include_faucet_key_and_are_unique() {
+        let keys = derive_worker_keys(FAUCET_KEY, 8);
+        assert_eq!(keys.len(), 8);
+        assert_ne!(keys[0], FAUCET_KEY);
+        assert!(!keys.iter().any(|key| key == FAUCET_KEY));
+
+        let unique: HashSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len());
+    }
+
+    #[test]
+    fn intermediate_keys_do_not_include_faucet_key_and_are_unique() {
+        let keys = derive_intermediate_keys(FAUCET_KEY, 8);
+        assert_eq!(keys.len(), 8);
+        assert_ne!(keys[0], FAUCET_KEY);
+        assert!(!keys.iter().any(|key| key == FAUCET_KEY));
+
+        let unique: HashSet<_> = keys.iter().collect();
+        assert_eq!(unique.len(), keys.len());
     }
 }
