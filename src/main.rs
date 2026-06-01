@@ -33,16 +33,22 @@ enum Cli {
     Faucet {
         #[arg(short, long)]
         config: Option<String>,
+        #[arg(long)]
+        fast: bool,
     },
     /// 压测（假设账户已有资金）
     Bench {
         #[arg(short, long)]
         config: Option<String>,
+        #[arg(long)]
+        fast: bool,
     },
     /// 回收剩余资金到 faucet
     Recover {
         #[arg(short, long)]
         config: Option<String>,
+        #[arg(long)]
+        fast: bool,
     },
 }
 
@@ -54,14 +60,18 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli {
-        Cli::Faucet { config } => {
+        Cli::Faucet { config, fast } => {
             let config_path = config.unwrap_or_else(|| "bench.toml".to_string());
             let config = Config::load(&config_path)?;
             let chain_id = detect_chain_id(&config.rpc.url).await?;
             let rpc = RpcClient::new(&config.rpc.url, chain_id, config.bench.rpc_concurrency);
             let (register_tx, register_rx) = mpsc::channel::<MonitorCommand>(100_000);
+            let (fast_gas_limit, fast_gas_price) = fast_gas_estimates(&config.bench);
+            if fast {
+                log::info!("[main] fast mode: skipping receipt fetch, using estimated gas");
+            }
             let mut monitor =
-                monitor::BlockMonitor::new(rpc.clone(), register_rx, config.bench.rpc_batch_size);
+                monitor::BlockMonitor::new(rpc.clone(), register_rx, config.bench.rpc_batch_size, fast, fast_gas_limit, fast_gas_price);
             let _pool_size = monitor.pool_size.clone();
             tokio::spawn(async move {
                 if let Err(e) = monitor.run().await {
@@ -70,14 +80,18 @@ async fn main() -> Result<()> {
             });
             run_faucet(&config, &rpc, chain_id, register_tx).await?;
         }
-        Cli::Bench { config } => {
+        Cli::Bench { config, fast } => {
             let config_path = config.unwrap_or_else(|| "bench.toml".to_string());
             let config = Config::load(&config_path)?;
             let chain_id = detect_chain_id(&config.rpc.url).await?;
             let rpc = RpcClient::new(&config.rpc.url, chain_id, config.bench.rpc_concurrency);
             let (register_tx, register_rx) = mpsc::channel::<MonitorCommand>(100_000);
+            let (fast_gas_limit, fast_gas_price) = fast_gas_estimates(&config.bench);
+            if fast {
+                log::info!("[main] fast mode: skipping receipt fetch, using estimated gas");
+            }
             let mut monitor =
-                monitor::BlockMonitor::new(rpc.clone(), register_rx, config.bench.rpc_batch_size);
+                monitor::BlockMonitor::new(rpc.clone(), register_rx, config.bench.rpc_batch_size, fast, fast_gas_limit, fast_gas_price);
             let pool_size = monitor.pool_size.clone();
             tokio::spawn(async move {
                 if let Err(e) = monitor.run().await {
@@ -86,14 +100,18 @@ async fn main() -> Result<()> {
             });
             run_bench(&config, &rpc, chain_id, register_tx, pool_size).await?;
         }
-        Cli::Recover { config } => {
+        Cli::Recover { config, fast } => {
             let config_path = config.unwrap_or_else(|| "bench.toml".to_string());
             let config = Config::load(&config_path)?;
             let chain_id = detect_chain_id(&config.rpc.url).await?;
             let rpc = RpcClient::new(&config.rpc.url, chain_id, config.bench.rpc_concurrency);
             let (register_tx, register_rx) = mpsc::channel::<MonitorCommand>(100_000);
+            let (fast_gas_limit, fast_gas_price) = fast_gas_estimates(&config.bench);
+            if fast {
+                log::info!("[main] fast mode: skipping receipt fetch, using estimated gas");
+            }
             let mut monitor =
-                monitor::BlockMonitor::new(rpc.clone(), register_rx, config.bench.rpc_batch_size);
+                monitor::BlockMonitor::new(rpc.clone(), register_rx, config.bench.rpc_batch_size, fast, fast_gas_limit, fast_gas_price);
             let _pool_size = monitor.pool_size.clone();
             tokio::spawn(async move {
                 if let Err(e) = monitor.run().await {
@@ -175,6 +193,13 @@ async fn detect_chain_id(url: &str) -> Result<u64> {
             .trim_start_matches("0x"),
         16,
     )?)
+}
+
+/// Estimated gas values for fast-mode synthetic receipts.
+fn fast_gas_estimates(bench: &BenchConfig) -> (u64, u128) {
+    let gas_limit = bench.transfer_gas_limit();
+    let gas_price = bench.max_fee_per_gas as u128 * 1_000_000_000;
+    (gas_limit, gas_price)
 }
 
 fn derive_bench_recipient(account: &Account) -> Address {

@@ -31,6 +31,9 @@ pub struct BlockMonitor {
     pub pool_size: Arc<AtomicU64>,
     register_rx: mpsc::Receiver<MonitorCommand>,
     rpc_batch_size: usize,
+    fast: bool,
+    fast_gas_limit: u64,
+    fast_gas_price: u128,
 }
 
 impl BlockMonitor {
@@ -38,6 +41,9 @@ impl BlockMonitor {
         rpc: RpcClient,
         register_rx: mpsc::Receiver<MonitorCommand>,
         rpc_batch_size: usize,
+        fast: bool,
+        fast_gas_limit: u64,
+        fast_gas_price: u128,
     ) -> Self {
         Self {
             rpc,
@@ -45,6 +51,9 @@ impl BlockMonitor {
             pool_size: Arc::new(AtomicU64::new(0)),
             register_rx,
             rpc_batch_size,
+            fast,
+            fast_gas_limit,
+            fast_gas_price,
         }
     }
 
@@ -175,7 +184,19 @@ impl BlockMonitor {
             self.pending.len()
         );
 
-        // Always fetch receipts
+        if self.fast {
+            for &tx_hash in &matched {
+                if let Some(reply) = self.pending.remove(&tx_hash) {
+                    let _ = reply.send(TxReceipt {
+                        success: true,
+                        gas_used: self.fast_gas_limit,
+                        effective_gas_price: self.fast_gas_price,
+                    });
+                }
+            }
+            return Ok(());
+        }
+
         for chunk in matched.chunks(self.rpc_batch_size) {
             let receipts = self.rpc.batch_get_receipts(chunk).await?;
             for (i, receipt) in receipts.iter().enumerate() {
