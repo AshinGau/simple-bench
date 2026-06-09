@@ -29,6 +29,7 @@ pub struct BlockMonitor {
     rpc: RpcClient,
     pending: HashMap<B256, oneshot::Sender<TxReceipt>>,
     pub pool_size: Arc<AtomicU64>,
+    pub current_block: Arc<AtomicU64>,
     register_rx: mpsc::Receiver<MonitorCommand>,
     rpc_batch_size: usize,
     fast: bool,
@@ -49,6 +50,7 @@ impl BlockMonitor {
             rpc,
             pending: HashMap::new(),
             pool_size: Arc::new(AtomicU64::new(0)),
+            current_block: Arc::new(AtomicU64::new(0)),
             register_rx,
             rpc_batch_size,
             fast,
@@ -59,6 +61,7 @@ impl BlockMonitor {
 
     pub async fn run(&mut self) -> Result<()> {
         let mut last_block = self.rpc.block_number().await?;
+        self.current_block.store(last_block, Ordering::Relaxed);
         let mut pool_check_count = 0u64;
         log::info!("[monitor] started at block={}", last_block);
 
@@ -87,6 +90,7 @@ impl BlockMonitor {
                 Ok(b) => b,
                 Err(_) => continue,
             };
+            self.current_block.store(current_block, Ordering::Relaxed);
 
             self.drain_registrations();
 

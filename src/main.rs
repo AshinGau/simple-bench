@@ -95,12 +95,13 @@ async fn main() -> Result<()> {
             let mut monitor =
                 monitor::BlockMonitor::new(rpc.clone(), register_rx, config.bench.rpc_batch_size, fast, fast_gas_limit, fast_gas_price);
             let pool_size = monitor.pool_size.clone();
+            let current_block = monitor.current_block.clone();
             tokio::spawn(async move {
                 if let Err(e) = monitor.run().await {
                     log::error!("[monitor] exited: {}", e);
                 }
             });
-            run_bench(&config, &rpc, chain_id, register_tx, pool_size).await?;
+            run_bench(&config, &rpc, chain_id, register_tx, pool_size, current_block).await?;
         }
         Cli::Recover { config, fast } => {
             let config_path = config.unwrap_or_else(|| "bench.toml".to_string());
@@ -808,6 +809,7 @@ async fn run_bench(
     chain_id: u64,
     register_tx: mpsc::Sender<MonitorCommand>,
     pool_size: Arc<AtomicU64>,
+    current_block: Arc<AtomicU64>,
 ) -> Result<()> {
     let worker_keys =
         config::derive_worker_keys(&config.faucet.private_key, config.bench.num_accounts);
@@ -924,6 +926,7 @@ async fn run_bench(
             active_count.clone(),
             stop.clone(),
             num_accounts,
+            current_block.clone(),
         )));
     }
 
@@ -948,9 +951,10 @@ async fn run_bench_worker(
     active_count: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     num_accounts: usize,
+    current_chain_block: Arc<AtomicU64>,
 ) {
     let estimated_gas = bench_cfg.estimated_gas();
-    let mut block_number = U256::from(0u64);
+    let mut counter: u64 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -969,6 +973,13 @@ async fn run_bench_worker(
             break;
         }
 
+        // EIP-2935 HISTORY_STORAGE only serves the most recent 8192 blocks.
+        // Query (current_chain_block - 100 - counter % 4000) to stay safely inside the ring
+        // and exercise different slots. For non-eip2935 workloads this value is unused.
+        let chain_head = current_chain_block.load(Ordering::Relaxed);
+        let query_block = chain_head.saturating_sub(100).saturating_sub(counter % 4000);
+        let block_number = U256::from(query_block);
+
         let signed = match bench_cfg.build_tx(&account, chain_id, block_number).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -978,7 +989,7 @@ async fn run_bench_worker(
         };
 
         let tx_hash = tx::raw_tx_hash(&signed.raw);
-        block_number += U256::from(1u64);
+        counter = counter.wrapping_add(1);
 
         // Register FIRST so monitor has the hash in `pending` before the tx is broadcast.
         // Without this, monitor may scan past the block where the tx lands before the
