@@ -660,12 +660,11 @@ enum BenchWorkload {
     Native,
     Erc20 { token_addresses: Arc<[Address]> },
     Eip2935,
-    Eip7702 { delegate: Address, authorizations: Arc<[SignedAuthorization]> },
+    Eip7702 { delegate: Address },
     /// Mix cycles through all 4 types round-robin per account.
     Mix {
         erc20_tokens: Arc<[Address]>,
         eip7702_delegate: Address,
-        eip7702_auths: Arc<[SignedAuthorization]>,
         counter: Arc<AtomicU64>,
     },
 }
@@ -693,12 +692,10 @@ impl BenchCfg {
             TransferType::Eip2935 => BenchWorkload::Eip2935,
             TransferType::Eip7702 => BenchWorkload::Eip7702 {
                 delegate: Address::ZERO,
-                authorizations: Arc::from(Vec::new()),
             },
             TransferType::Mix => BenchWorkload::Mix {
                 erc20_tokens: token_addresses,
                 eip7702_delegate: Address::ZERO,
-                eip7702_auths: Arc::from(Vec::new()),
                 counter: Arc::new(AtomicU64::new(0)),
             },
         };
@@ -748,14 +745,14 @@ impl BenchCfg {
             BenchWorkload::Eip2935 => {
                 tx::build_eip2935_tx(account, block_number, self.fee_config, chain_id).await
             }
-            BenchWorkload::Eip7702 { authorizations, .. } => {
-                let auth = authorizations[account.nonce as usize % authorizations.len()].clone();
+            BenchWorkload::Eip7702 { delegate, .. } => {
+                // Self-sponsored: auth.nonce must be account.nonce + 1
+                let auth = tx::sign_authorization(account, *delegate, chain_id, account.nonce + 1).await?;
                 tx::build_eip7702_tx(account, auth, self.fee_config, chain_id).await
             }
             BenchWorkload::Mix {
                 erc20_tokens,
-                eip7702_delegate: _,
-                eip7702_auths,
+                eip7702_delegate,
                 counter,
             } => {
                 let idx = counter.fetch_add(1, Ordering::Relaxed) % 4;
@@ -783,8 +780,8 @@ impl BenchCfg {
                             .await
                     }
                     3 => {
-                        let auth =
-                            eip7702_auths[account.nonce as usize % eip7702_auths.len()].clone();
+                        // Self-sponsored: auth.nonce must be account.nonce + 1
+                        let auth = tx::sign_authorization(account, *eip7702_delegate, chain_id, account.nonce + 1).await?;
                         tx::build_eip7702_tx(account, auth, self.fee_config, chain_id).await
                     }
                     _ => unreachable!(),
@@ -843,36 +840,20 @@ async fn run_bench(
         Address::ZERO
     };
 
-    // Pre-sign EIP-7702 authorizations for each worker
-    let eip7702_auths = if config.bench.needs_eip7702_deploy() {
-        let mut auths = Vec::with_capacity(accounts.len());
-        for account in &accounts {
-            let auth =
-                tx::sign_authorization(account, delegate_address, chain_id).await?;
-            auths.push(auth);
-        }
-        log::info!("[bench] pre-signed {} EIP-7702 authorizations", auths.len());
-        Arc::<[SignedAuthorization]>::from(auths)
-    } else {
-        Arc::<[SignedAuthorization]>::from(Vec::new())
-    };
-
     let mix_erc20_tokens = token_addresses.clone();
     let mut bench_cfg = BenchCfg::from_config(&config.bench, token_addresses, chain_id, &worker_keys)?;
 
-    // Post-resolve Mix config with delegate/auths
+    // Post-resolve workloads that need the delegate address. Auth is signed fresh per tx
+    // in the worker (auth.nonce = account.nonce + 1 for self-sponsored).
     if config.bench.transfer_type == TransferType::Mix {
         bench_cfg.workload = BenchWorkload::Mix {
             erc20_tokens: mix_erc20_tokens,
             eip7702_delegate: delegate_address,
-            eip7702_auths,
             counter: Arc::new(AtomicU64::new(0)),
         };
     } else if config.bench.transfer_type == TransferType::Eip7702 {
-        // Resolve Eip7702 with pre-signed auths
         bench_cfg.workload = BenchWorkload::Eip7702 {
             delegate: delegate_address,
-            authorizations: eip7702_auths,
         };
     }
 
