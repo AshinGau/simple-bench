@@ -980,6 +980,26 @@ async fn run_bench_worker(
         let tx_hash = tx::raw_tx_hash(&signed.raw);
         block_number += U256::from(1u64);
 
+        // Register FIRST so monitor has the hash in `pending` before the tx is broadcast.
+        // Without this, monitor may scan past the block where the tx lands before the
+        // worker registers, and the confirmation is missed forever.
+        let (confirm_tx, confirm_rx) = oneshot::channel();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        if register_tx
+            .send(MonitorCommand::Register(RegisterTx {
+                hash: tx_hash,
+                reply: confirm_tx,
+                registered: registered_tx,
+            }))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if registered_rx.await.is_err() {
+            break;
+        }
+
         // Send via BatchSender
         let (reply_tx, reply_rx) = oneshot::channel();
         if batch_tx
@@ -1003,24 +1023,6 @@ async fn run_bench_worker(
         }
 
         stats.inc_sent();
-
-        // Register and wait for confirmation
-        let (confirm_tx, confirm_rx) = oneshot::channel();
-        let (registered_tx, registered_rx) = oneshot::channel();
-        if register_tx
-            .send(MonitorCommand::Register(RegisterTx {
-                hash: tx_hash,
-                reply: confirm_tx,
-                registered: registered_tx,
-            }))
-            .await
-            .is_err()
-        {
-            break;
-        }
-        if registered_rx.await.is_err() {
-            break;
-        }
 
         let receipt = match confirm_rx.await {
             Ok(r) => r,
