@@ -9,6 +9,7 @@ use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use alloy::eips::eip7702::SignedAuthorization;
 use alloy::primitives::{Address, Bytes, B256, U256};
 use anyhow::Result;
 use clap::Parser;
@@ -16,7 +17,8 @@ use tokio::sync::{mpsc, oneshot};
 
 use account::Account;
 use config::{
-    BenchConfig, Config, TransferType, ERC20_TRANSFER_GAS_LIMIT, NATIVE_TRANSFER_GAS_LIMIT,
+    BenchConfig, Config, TransferType, EIP2935_CALL_GAS_LIMIT, EIP7702_SET_CODE_GAS_LIMIT,
+    ERC20_TRANSFER_GAS_LIMIT, NATIVE_TRANSFER_GAS_LIMIT,
 };
 use monitor::{MonitorCommand, RegisterTx, TxReceipt};
 use rpc::RpcClient;
@@ -250,7 +252,7 @@ fn intermediate_gas_reserve(bench: &BenchConfig, worker_count: usize) -> U256 {
     let native_reserve =
         Account::estimated_gas_cost(bench.max_fee_per_gas, NATIVE_TRANSFER_GAS_LIMIT)
             * worker_count;
-    let erc20_reserve = if bench.transfer_type == TransferType::Erc20 {
+    let erc20_reserve = if bench.needs_erc20_faucet() {
         Account::estimated_gas_cost(bench.max_fee_per_gas, ERC20_TRANSFER_GAS_LIMIT)
             * worker_count
             * U256::from(bench.num_tokens)
@@ -295,6 +297,29 @@ async fn discover_erc20_token_addresses(
         }
     }
     Ok(Arc::<[Address]>::from(token_addresses))
+}
+
+async fn discover_delegate_address(config: &Config) -> Result<Address> {
+    let faucet = Account::from_key(&config.faucet.private_key)?;
+    // Delegate is deployed by faucet as the very last contract (after ERC20 + HistoryReader)
+    // Its nonce is faucet_nonce - 1 (the last thing faucet deployed)
+    let rpc = RpcClient::new(&config.rpc.url, 1, 1);
+    let faucet_nonce = rpc.get_nonce(faucet.address).await?;
+    let delegate_nonce = faucet_nonce.checked_sub(1).ok_or_else(|| {
+        anyhow::anyhow!(
+            "faucet nonce too low to recover delegate; run faucet first with eip7702/mix config"
+        )
+    })?;
+    let addr = tx::create_address(faucet.address, delegate_nonce);
+    let codes = rpc.batch_has_code(&[addr]).await?;
+    let has_code = codes.first().copied().unwrap_or(false);
+    if !has_code {
+        anyhow::bail!(
+            "no contract code at delegate 0x{:x}; run faucet first with eip7702/mix config",
+            addr
+        );
+    }
+    Ok(addr)
 }
 
 // ── submit_raws_async ──────────────────────────────────────────────
@@ -435,7 +460,7 @@ async fn run_faucet(
     log::info!("[faucet] Phase 1b done: intermediates → workers");
 
     // === Phase 2: ERC20 ===
-    if config.bench.transfer_type == TransferType::Erc20 {
+    if config.bench.needs_erc20_faucet() {
         let bytecode = tx::simple_token_bytecode();
         let supply = U256::MAX;
         let token_per_worker = U256::from(1_000_000u64) * U256::from(10u64.pow(18));
@@ -533,6 +558,24 @@ async fn run_faucet(
         log::info!("[faucet] Phase 2b done: intermediates → workers (ERC20)");
     }
 
+    // === Phase 3: EIP-7702 Delegate deploy ===
+    if config.bench.needs_eip7702_deploy() {
+        let master_nonce = rpc.get_nonce(faucet.address).await?;
+        let delegate_bytecode = tx::delegate_contract_bytecode();
+        let mut s = faucet.clone();
+        s.nonce = master_nonce;
+        let signed =
+            tx::build_deploy_tx(&s, &delegate_bytecode, U256::ZERO, &config.bench, chain_id).await?;
+        let delegate_address = tx::create_address(s.address, s.nonce);
+        let (_, c) =
+            submit_raws_async(rpc, &register_tx, &[signed.raw.clone()], rpc_batch).await?;
+        wait_confirmations(c).await?;
+        log::info!(
+            "[faucet] Phase 3 done: EIP-7702 delegate deployed at 0x{:x}",
+            delegate_address
+        );
+    }
+
     log::info!("[faucet] complete");
     Ok(())
 }
@@ -615,6 +658,15 @@ async fn spawn_batch_sender(
 enum BenchWorkload {
     Native,
     Erc20 { token_addresses: Arc<[Address]> },
+    Eip2935,
+    Eip7702 { delegate: Address, authorizations: Arc<[SignedAuthorization]> },
+    /// Mix cycles through all 4 types round-robin per account.
+    Mix {
+        erc20_tokens: Arc<[Address]>,
+        eip7702_delegate: Address,
+        eip7702_auths: Arc<[SignedAuthorization]>,
+        counter: Arc<AtomicU64>,
+    },
 }
 
 #[derive(Clone)]
@@ -628,52 +680,124 @@ struct BenchCfg {
 }
 
 impl BenchCfg {
-    fn from_config(config: &BenchConfig, token_addresses: Arc<[Address]>) -> Self {
+    fn from_config(
+        config: &BenchConfig,
+        token_addresses: Arc<[Address]>,
+        _chain_id: u64,
+        _worker_keys: &[String],
+    ) -> Result<Self> {
         let workload = match config.transfer_type {
             TransferType::Native => BenchWorkload::Native,
             TransferType::Erc20 => BenchWorkload::Erc20 { token_addresses },
+            TransferType::Eip2935 => BenchWorkload::Eip2935,
+            TransferType::Eip7702 => BenchWorkload::Eip7702 {
+                delegate: Address::ZERO,
+                authorizations: Arc::from(Vec::new()),
+            },
+            TransferType::Mix => BenchWorkload::Mix {
+                erc20_tokens: token_addresses,
+                eip7702_delegate: Address::ZERO,
+                eip7702_auths: Arc::from(Vec::new()),
+                counter: Arc::new(AtomicU64::new(0)),
+            },
         };
-        Self {
+        let (gas_limit, amount, receipt_value) = match config.transfer_type {
+            TransferType::Native => (NATIVE_TRANSFER_GAS_LIMIT, U256::from(1), U256::from(1)),
+            TransferType::Erc20 => (ERC20_TRANSFER_GAS_LIMIT, U256::from(1), U256::ZERO),
+            TransferType::Eip2935 => (EIP2935_CALL_GAS_LIMIT, U256::ZERO, U256::ZERO),
+            TransferType::Eip7702 => (EIP7702_SET_CODE_GAS_LIMIT, U256::ZERO, U256::ZERO),
+            TransferType::Mix => (NATIVE_TRANSFER_GAS_LIMIT, U256::from(1), U256::from(1)),
+        };
+        Ok(Self {
             workload,
             fee_config: tx::TxFeeConfig::from(config),
             max_pool_size: config.max_pool_size,
-            amount: config.transfer_amount(),
-            receipt_value: config.transfer_native_value(),
-            gas_limit: config.transfer_gas_limit(),
-        }
+            amount,
+            receipt_value,
+            gas_limit,
+        })
     }
 
     fn estimated_gas(&self) -> U256 {
         Account::estimated_gas_cost(self.fee_config.max_fee_per_gas, self.gas_limit)
     }
 
-    async fn build_tx(&self, account: &Account, chain_id: u64) -> Result<tx::SignedTx> {
-        let to = derive_bench_recipient(account);
+    async fn build_tx(
+        &self,
+        account: &Account,
+        chain_id: u64,
+        block_number: U256,
+    ) -> Result<tx::SignedTx> {
         match &self.workload {
             BenchWorkload::Native => {
+                let to = derive_bench_recipient(account);
                 tx::build_native_transfer(
-                    account,
-                    to,
-                    self.amount,
-                    self.fee_config,
-                    chain_id,
-                    self.gas_limit,
+                    account, to, self.amount, self.fee_config, chain_id, self.gas_limit,
                 )
                 .await
             }
             BenchWorkload::Erc20 { token_addresses } => {
+                let to = derive_bench_recipient(account);
                 let token = token_addresses[account.nonce as usize % token_addresses.len()];
                 tx::build_erc20_transfer(
-                    account,
-                    token,
-                    to,
-                    self.amount,
-                    self.fee_config,
-                    chain_id,
-                    self.gas_limit,
+                    account, token, to, self.amount, self.fee_config, chain_id, self.gas_limit,
                 )
                 .await
             }
+            BenchWorkload::Eip2935 => {
+                tx::build_eip2935_tx(account, block_number, self.fee_config, chain_id).await
+            }
+            BenchWorkload::Eip7702 { authorizations, .. } => {
+                let auth = authorizations[account.nonce as usize % authorizations.len()].clone();
+                tx::build_eip7702_tx(account, auth, self.fee_config, chain_id).await
+            }
+            BenchWorkload::Mix {
+                erc20_tokens,
+                eip7702_delegate: _,
+                eip7702_auths,
+                counter,
+            } => {
+                let idx = counter.fetch_add(1, Ordering::Relaxed) % 4;
+                match idx {
+                    0 => {
+                        let to = derive_bench_recipient(account);
+                        tx::build_native_transfer(
+                            account, to, U256::from(1), self.fee_config, chain_id,
+                            NATIVE_TRANSFER_GAS_LIMIT,
+                        )
+                        .await
+                    }
+                    1 => {
+                        let to = derive_bench_recipient(account);
+                        let token =
+                            erc20_tokens[account.nonce as usize % erc20_tokens.len()];
+                        tx::build_erc20_transfer(
+                            account, token, to, U256::from(1), self.fee_config, chain_id,
+                            ERC20_TRANSFER_GAS_LIMIT,
+                        )
+                        .await
+                    }
+                    2 => {
+                        tx::build_eip2935_tx(account, block_number, self.fee_config, chain_id)
+                            .await
+                    }
+                    3 => {
+                        let auth =
+                            eip7702_auths[account.nonce as usize % eip7702_auths.len()].clone();
+                        tx::build_eip7702_tx(account, auth, self.fee_config, chain_id).await
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+}
+
+impl tx::TxFeeConfig {
+    fn from(config: &BenchConfig) -> Self {
+        Self {
+            max_priority_fee_per_gas: config.max_priority_fee_per_gas,
+            max_fee_per_gas: config.max_fee_per_gas,
         }
     }
 }
@@ -701,13 +825,54 @@ async fn run_bench(
         account.balance = balances[i];
     }
 
-    let token_addresses = if config.bench.transfer_type == TransferType::Erc20 {
+    let token_addresses = if config.bench.needs_erc20_faucet() {
         let tokens = discover_erc20_token_addresses(config, rpc).await?;
         log::info!("[bench] recovered {} ERC20 token addresses", tokens.len());
         tokens
     } else {
         Arc::<[Address]>::from(Vec::new())
     };
+
+    let delegate_address = if config.bench.needs_eip7702_deploy() {
+        let d = discover_delegate_address(config).await?;
+        log::info!("[bench] recovered delegate at 0x{:x}", d);
+        d
+    } else {
+        Address::ZERO
+    };
+
+    // Pre-sign EIP-7702 authorizations for each worker
+    let eip7702_auths = if config.bench.needs_eip7702_deploy() {
+        let mut auths = Vec::with_capacity(accounts.len());
+        for account in &accounts {
+            let auth =
+                tx::sign_authorization(account, delegate_address, chain_id).await?;
+            auths.push(auth);
+        }
+        log::info!("[bench] pre-signed {} EIP-7702 authorizations", auths.len());
+        Arc::<[SignedAuthorization]>::from(auths)
+    } else {
+        Arc::<[SignedAuthorization]>::from(Vec::new())
+    };
+
+    let mix_erc20_tokens = token_addresses.clone();
+    let mut bench_cfg = BenchCfg::from_config(&config.bench, token_addresses, chain_id, &worker_keys)?;
+
+    // Post-resolve Mix config with delegate/auths
+    if config.bench.transfer_type == TransferType::Mix {
+        bench_cfg.workload = BenchWorkload::Mix {
+            erc20_tokens: mix_erc20_tokens,
+            eip7702_delegate: delegate_address,
+            eip7702_auths,
+            counter: Arc::new(AtomicU64::new(0)),
+        };
+    } else if config.bench.transfer_type == TransferType::Eip7702 {
+        // Resolve Eip7702 with pre-signed auths
+        bench_cfg.workload = BenchWorkload::Eip7702 {
+            delegate: delegate_address,
+            authorizations: eip7702_auths,
+        };
+    }
 
     log::info!(
         "[bench] {} workers, chain_id={}, type={:?}",
@@ -744,8 +909,6 @@ async fn run_bench(
             }
         });
     }
-
-    let bench_cfg = BenchCfg::from_config(&config.bench, token_addresses);
 
     let mut handles = Vec::new();
     for (idx, account) in accounts.into_iter().enumerate() {
@@ -787,6 +950,7 @@ async fn run_bench_worker(
     num_accounts: usize,
 ) {
     let estimated_gas = bench_cfg.estimated_gas();
+    let mut block_number = U256::from(0u64);
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -805,7 +969,7 @@ async fn run_bench_worker(
             break;
         }
 
-        let signed = match bench_cfg.build_tx(&account, chain_id).await {
+        let signed = match bench_cfg.build_tx(&account, chain_id, block_number).await {
             Ok(signed) => signed,
             Err(e) => {
                 log::error!("[worker#{}] build_tx: {}", idx, e);
@@ -814,6 +978,7 @@ async fn run_bench_worker(
         };
 
         let tx_hash = tx::raw_tx_hash(&signed.raw);
+        block_number += U256::from(1u64);
 
         // Send via BatchSender
         let (reply_tx, reply_rx) = oneshot::channel();

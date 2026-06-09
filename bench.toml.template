@@ -1,18 +1,25 @@
 [faucet]
-private_key = "0x..."
-faucet_eth_balance = 600
+private_key = "0xac0974bec39a17e36ba4a6b4d238ff944bacb478cbed5efcae784d7bf4f2ff80"
+faucet_eth_balance = 60000000000
 
 [rpc]
-url = "http://34.66.62.28:8545"
+url = "http://34.70.48.224:8545"
 
 [bench]
-num_accounts = 500
-rpc_concurrency = 64
-num_inflight_senders = 400
-transfer_type = "erc20"
+num_accounts = 10000
+rpc_concurrency = 2048
+
+# transfer_type options:
+#   native  — EIP-1559 ETH transfers
+#   erc20   — ERC20 token transfers
+#   eip2935 — call HISTORY_STORAGE (EIP-2935) to query block hashes
+#   eip7702 — EIP-7702 SetCode delegation transactions
+#   mix     — round-robin through all 4 types
+transfer_type = "native"
+
 max_fee_per_gas = 60
 max_priority_fee_per_gas = 1
 num_tokens = 2
-max_pool_size = 40000
-rpc_batch_size = 64
+max_pool_size = 100000
+rpc_batch_size = 2048
 faucet_level = 10

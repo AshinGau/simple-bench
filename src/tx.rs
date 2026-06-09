@@ -1,12 +1,14 @@
-use alloy::consensus::{SignableTransaction, TxEip1559};
+use alloy::consensus::{SignableTransaction, TxEip1559, TxEip7702};
 use alloy::eips::Encodable2718;
+use alloy::eips::eip7702::{Authorization, SignedAuthorization};
 use alloy::primitives::{keccak256, Address, Bytes, B256, U256};
 use alloy::signers::Signer;
 use anyhow::Result;
 
 use crate::account::Account;
 use crate::config::{
-    BenchConfig, ERC20_DEPLOY_GAS_LIMIT, ERC20_TRANSFER_GAS_LIMIT, NATIVE_TRANSFER_GAS_LIMIT,
+    BenchConfig, EIP2935_CALL_GAS_LIMIT, EIP7702_SET_CODE_GAS_LIMIT,
+    ERC20_DEPLOY_GAS_LIMIT, ERC20_TRANSFER_GAS_LIMIT, NATIVE_TRANSFER_GAS_LIMIT,
 };
 
 pub struct SignedTx {
@@ -234,4 +236,91 @@ fn usize_to_be_bytes(value: usize) -> Vec<u8> {
         .position(|b| *b != 0)
         .unwrap_or(bytes.len() - 1);
     bytes[first..].to_vec()
+}
+
+// ── EIP-2935 / EIP-7702 extensions ────────────────────────────────
+
+/// HISTORY_STORAGE precompile address (EIP-2935).
+pub const HISTORY_STORAGE_ADDRESS: Address = Address::new([
+    0x00, 0x00, 0xF9, 0x08, 0x27, 0xF1, 0xC5, 0x3A, 0x10, 0xCB,
+    0x7A, 0x02, 0x33, 0x5B, 0x17, 0x53, 0x20, 0x00, 0x29, 0x35,
+]);
+
+/// Build an EIP-2935 call to HISTORY_STORAGE for the given block number.
+/// Calldata is abi.encode(block_number) — 32-byte U256.
+/// HISTORY_STORAGE's fallback returns the block hash for that block.
+pub async fn build_eip2935_tx(
+    account: &Account,
+    block_number: U256,
+    fee_config: TxFeeConfig,
+    chain_id: u64,
+) -> Result<SignedTx> {
+    let (max_prio_wei, max_fee_wei) = fee_config.gas_prices();
+    let tx = TxEip1559 {
+        chain_id,
+        nonce: account.nonce,
+        max_priority_fee_per_gas: max_prio_wei,
+        max_fee_per_gas: max_fee_wei,
+        gas_limit: EIP2935_CALL_GAS_LIMIT,
+        to: alloy::primitives::TxKind::Call(HISTORY_STORAGE_ADDRESS),
+        value: U256::ZERO,
+        access_list: Default::default(),
+        input: Bytes::from(block_number.to_be_bytes::<32>().to_vec()),
+    };
+    sign_and_encode(account, tx).await
+}
+
+/// Deploy a minimal fallback-only contract used as EIP-7702 delegation target.
+pub fn delegate_contract_bytecode() -> Vec<u8> {
+    hex::decode(
+        "6080604052348015600e575f80fd5b50603e80601a5f395ff3fe60806040525f80fdfea164736f6c634300081e000a"
+    ).expect("invalid delegate bytecode")
+}
+
+/// Sign an EIP-7702 authorization delegating the account's code to `target`.
+pub async fn sign_authorization(
+    account: &Account,
+    target: Address,
+    chain_id: u64,
+) -> Result<SignedAuthorization> {
+    let signer = account.signer()?;
+    let auth = Authorization {
+        chain_id: U256::from(chain_id),
+        address: target,
+        nonce: account.nonce,
+    };
+    let hash = auth.signature_hash();
+    let sig = signer.sign_hash(&hash).await?;
+    Ok(auth.into_signed(sig))
+}
+
+/// Build and sign an EIP-7702 SetCode transaction.
+/// The authority delegates its code to the target in `auth`,
+/// and the transaction calls the target contract.
+pub async fn build_eip7702_tx(
+    account: &Account,
+    auth: SignedAuthorization,
+    fee_config: TxFeeConfig,
+    chain_id: u64,
+) -> Result<SignedTx> {
+    let (max_prio_wei, max_fee_wei) = fee_config.gas_prices();
+    let tx = TxEip7702 {
+        chain_id,
+        nonce: account.nonce,
+        max_priority_fee_per_gas: max_prio_wei,
+        max_fee_per_gas: max_fee_wei,
+        gas_limit: EIP7702_SET_CODE_GAS_LIMIT,
+        to: *auth.inner().address(),
+        value: U256::ZERO,
+        access_list: Default::default(),
+        authorization_list: vec![auth],
+        input: Bytes::new(),
+    };
+    let signer = account.signer()?;
+    let hash = tx.signature_hash();
+    let sig = signer.sign_hash(&hash).await?;
+    let signed = tx.into_signed(sig);
+    Ok(SignedTx {
+        raw: Bytes::from(signed.encoded_2718()),
+    })
 }

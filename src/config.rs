@@ -45,6 +45,12 @@ pub struct BenchConfig {
 pub enum TransferType {
     Native,
     Erc20,
+    #[serde(rename = "eip2935")]
+    Eip2935,
+    #[serde(rename = "eip7702")]
+    Eip7702,
+    #[serde(rename = "mix")]
+    Mix,
 }
 
 fn default_rpc_batch_size() -> usize {
@@ -58,6 +64,10 @@ fn default_faucet_level() -> usize {
 pub const NATIVE_TRANSFER_GAS_LIMIT: u64 = 21_000;
 pub const ERC20_TRANSFER_GAS_LIMIT: u64 = 100_000;
 pub const ERC20_DEPLOY_GAS_LIMIT: u64 = 1_500_000;
+pub const EIP2935_CALL_GAS_LIMIT: u64 = 50_000;
+pub const EIP7702_SET_CODE_GAS_LIMIT: u64 = 100_000;
+pub const EIP7702_DELEGATE_DEPLOY_GAS_LIMIT: u64 = 300_000;
+pub const HISTORY_READER_DEPLOY_GAS_LIMIT: u64 = 500_000;
 
 /// Parse ETH amount (number or string) to wei.
 fn from_eth_to_u256<'de, D>(deserializer: D) -> Result<U256, D::Error>
@@ -150,6 +160,9 @@ impl BenchConfig {
         match self.transfer_type {
             TransferType::Native => NATIVE_TRANSFER_GAS_LIMIT,
             TransferType::Erc20 => ERC20_TRANSFER_GAS_LIMIT,
+            TransferType::Eip2935 => EIP2935_CALL_GAS_LIMIT,
+            TransferType::Eip7702 => EIP7702_SET_CODE_GAS_LIMIT,
+            TransferType::Mix => NATIVE_TRANSFER_GAS_LIMIT,
         }
     }
 
@@ -161,7 +174,22 @@ impl BenchConfig {
         match self.transfer_type {
             TransferType::Native => self.transfer_amount(),
             TransferType::Erc20 => U256::ZERO,
+            TransferType::Eip2935 => U256::ZERO,
+            TransferType::Eip7702 => U256::ZERO,
+            TransferType::Mix => U256::from(1),
         }
+    }
+
+    pub fn needs_erc20_faucet(&self) -> bool {
+        matches!(self.transfer_type, TransferType::Erc20 | TransferType::Mix)
+    }
+
+    pub fn needs_eip7702_deploy(&self) -> bool {
+        matches!(self.transfer_type, TransferType::Eip7702 | TransferType::Mix)
+    }
+
+    pub fn needs_eip2935_deploy(&self) -> bool {
+        matches!(self.transfer_type, TransferType::Eip2935 | TransferType::Mix)
     }
 }
 

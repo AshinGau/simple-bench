@@ -1,71 +1,111 @@
 # simple_bench
 
-极简 EVM 压测工具，用于 Gravity 网络性能测试。
+Gravity EVM 极简压测工具。支持多种交易类型，用于链上吞吐量和延迟测试。
 
 ## 快速开始
 
 ```bash
-# 1. 创建配置文件
+# 1. 配置文件
 cp bench.toml.template bench.toml
-# 编辑 bench.toml，填入 faucet private_key
+# 编辑：填 faucet private_key、RPC url、选择 transfer_type
 
-# 2. 运行压测
-cargo run
+# 2. 初始化资金 + 部署合约
+cargo run -- faucet
 
-# 3. 回收资金
-cargo run -- --recover
+# 3. 压测
+cargo run -- bench
+
+# 4. 回收剩余资金（可选）
+cargo run -- recover
 ```
 
-## 命令行参数
+## 命令
 
 ```
-simple_bench [OPTIONS]
+simple_bench faucet    初始化：分发 ETH、部署合约、分发 token
+simple_bench bench     压测（假设 faucet 已完成）
+simple_bench recover   回收所有账户剩余资金到 faucet
+```
 
-OPTIONS:
-  -c, --config <PATH>   配置文件路径 (默认: bench.toml)
-      --recover         回收所有 worker 剩余资金到 faucet
-      --receipt         监控 receipt，区分 success/fail (默认只确认上链)
-  -h, --help            帮助
+每个命令支持 `-c <config>` 指定配置文件（默认 `bench.toml`），`--fast` 跳过 receipt 拉取。
+
+## 工作原理
+
+```
+┌─────────┐     ┌──────────┐     ┌───────────┐
+│ faucet  │ ──▶ │  worker  │ ──▶ │   chain   │
+│ 分发资金 │     │ 循环发交易 │     │ (Gravity) │
+│ 部署合约 │     └──────────┘     └───────────┘
+└─────────┘           │                │
+                      ▼                ▼
+               ┌──────────┐    ┌───────────┐
+               │BatchSender│    │  Monitor  │
+               │ 批量发送   │    │ 追踪确认   │
+               └──────────┘    └───────────┘
+```
+
+1. **faucet**: 从 faucet 私钥派生出 N 个 worker 账户，分层分发 ETH；根据 transfer_type 部署 ERC20 / Delegate 合约并分发 token
+2. **bench**: 每个 worker 循环发送交易 → BatchSender 批量提交 → Monitor 追踪上链 → 更新 nonce/余额
+3. **flow control**: Monitor 定期检查 mempool size，超过 `max_pool_size` 暂停发送；RPC 请求受 `rpc_concurrency` 上限约束
+4. **结束**: worker 余额低于 gas 预估时退出；超过半数 worker 退出后全局停止
+
+### faucet 分阶段执行
+
+```
+Phase 1: Native ETH
+  1a: faucet → intermediate（分层分发）
+  1b: intermediate → workers（并行，按 workers/level 分片）
+
+Phase 2: ERC20（仅 transfer_type=erc20 或 mix）
+  2a: faucet 部署 N 个 ERC20 合约 → 向 intermediate 分发 token
+  2b: intermediate → workers（并行分发 token）
+
+Phase 3: EIP-7702 Delegate（仅 transfer_type=eip7702 或 mix）
+  3:  faucet 部署 Delegate 合约
 ```
 
 ## 配置说明 (bench.toml)
 
-```toml
-[faucet]
-private_key = "0x..."
-faucet_eth_balance = 5000    # 分发总额(ETH), 平均分配给 num_accounts
+### [faucet]
 
-[rpc]
-url = "https://mainnet-rpc.gravity.xyz"
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `private_key` | hex | faucet 私钥，资金和合约从该地址发出 |
+| `faucet_eth_balance` | ETH | 分发总 ETH 量，均分到 `faucet_level` 个 intermediate |
 
-[bench]
-num_accounts = 100           # 测试账户数
-rpc_concurrency = 32         # 全局 JSON-RPC HTTP 请求并发上限
-num_inflight_senders = 50    # 最大未上链确认 sender 数
-transfer_type = "native"     # "native" 或 "erc20"
-max_fee_per_gas = 50         # Gwei
-max_priority_fee_per_gas = 1 # Gwei
-num_tokens = 2               # ERC20 合约数 (transfer_type=erc20 时生效)
-max_pool_size = 40000        # mempool pending 上限，超过则暂停发送
-```
+### [rpc]
 
-## 工作原理
+| 参数 | 类型 | 说明 |
+|---|---|---|
+| `url` | string | Gravity RPC 端点 |
 
-1. **启动**: faucet 批量/并发提交初始化交易，然后通过区块监控确认上链
-2. **压测**: 每个 worker 循环发交易，最多 `num_inflight_senders` 个 sender 同时等待上链确认
-3. **RPC 流控**: 所有 JSON-RPC 请求共享 `rpc_concurrency` 并发上限，收到 RPC 回复后释放额度
-4. **Mempool 流控**: monitor 定期检查 mempool size，超过 `max_pool_size` 则暂停发送
-5. **结束**: 所有 worker 余额不足时自动结束，输出统计
+### [bench]
 
-### Receipt 监控
+| 参数 | 类型 | 默认值 | 说明 |
+|---|---|---|---|
+| `num_accounts` | int | — | worker 账户总数 |
+| `rpc_concurrency` | int | — | 全局限流：同时进行的 JSON-RPC 请求数上限 |
+| `transfer_type` | string | — | 交易类型，见下方 |
+| `max_fee_per_gas` | int | — | EIP-1559 maxFeePerGas（Gwei） |
+| `max_priority_fee_per_gas` | int | — | EIP-1559 maxPriorityFeePerGas（Gwei） |
+| `max_pool_size` | int | — | mempool pending tx 上限，超过暂停发送 |
+| `num_tokens` | int | `0` | ERC20 合约数（erc20 / mix 时生效） |
+| `rpc_batch_size` | int | `64` | 每批 JSON-RPC batch 请求的 tx 数 |
+| `faucet_level` | int | `10` | intermediate 层数，worker 被均分成 level 组并行分发 |
+| `faucet_eth_per_level` | ETH | 均分 | 每个 intermediate 收到的 ETH（默认 `faucet_eth_balance / faucet_level`） |
 
-- 默认模式: 通过区块 tx hash 匹配确认上链，不查 receipt
-- `--receipt` 模式: 对匹配到的 tx hash 额外 batch 拉取 receipt，区分 success/fail/revert
+### transfer_type
 
-两种模式下，nonce 均在 tx 被打包进区块后递增（无论成功或 revert）。
+| 值 | 交易内容 | 消耗 gas/笔 | 需要 faucet |
+|---|---|---|---|
+| `native` | EIP-1559 ETH 转账，value=1 wei | 21,000 | ETH 分发 |
+| `erc20` | ERC20 transfer | 100,000 | ETH 分发 + 部署 ERC20 + 分发 token |
+| `eip2935` | 调用 `HISTORY_STORAGE`（EIP-2935）查询区块哈希 | 50,000 | ETH 分发 |
+| `eip7702` | EIP-7702 SetCode 委托交易 | 100,000 | ETH 分发 + 部署 Delegate 合约 |
+| `mix` | 四种类型轮转（native→erc20→eip2935→eip7702） | 按类型 | 全部（ETH + ERC20 + Delegate） |
 
 ## 依赖
 
 - Rust 2021+
-- alloy 2.0 (EVM 签名/编码)
-- reqwest (HTTP RPC)
+- alloy 2.0（EVM 签名/编码/类型）
+- reqwest（HTTP JSON-RPC）
