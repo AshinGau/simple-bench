@@ -278,16 +278,22 @@ pub fn delegate_contract_bytecode() -> Vec<u8> {
 }
 
 /// Sign an EIP-7702 authorization delegating the account's code to `target`.
+///
+/// `auth_nonce` is the authority's expected nonce at the time the authorization is
+/// processed. Per EIP-7702 / Pectra, for a self-sponsored tx (authority == tx sender)
+/// this MUST be `account.nonce + 1`, because the transaction nonce check runs before
+/// authorization processing and increments the sender's nonce by 1 first.
 pub async fn sign_authorization(
     account: &Account,
     target: Address,
     chain_id: u64,
+    auth_nonce: u64,
 ) -> Result<SignedAuthorization> {
     let signer = account.signer()?;
     let auth = Authorization {
         chain_id: U256::from(chain_id),
         address: target,
-        nonce: account.nonce,
+        nonce: auth_nonce,
     };
     let hash = auth.signature_hash();
     let sig = signer.sign_hash(&hash).await?;

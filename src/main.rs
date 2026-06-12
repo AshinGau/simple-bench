@@ -95,12 +95,13 @@ async fn main() -> Result<()> {
             let mut monitor =
                 monitor::BlockMonitor::new(rpc.clone(), register_rx, config.bench.rpc_batch_size, fast, fast_gas_limit, fast_gas_price);
             let pool_size = monitor.pool_size.clone();
+            let current_block = monitor.current_block.clone();
             tokio::spawn(async move {
                 if let Err(e) = monitor.run().await {
                     log::error!("[monitor] exited: {}", e);
                 }
             });
-            run_bench(&config, &rpc, chain_id, register_tx, pool_size).await?;
+            run_bench(&config, &rpc, chain_id, register_tx, pool_size, current_block).await?;
         }
         Cli::Recover { config, fast } => {
             let config_path = config.unwrap_or_else(|| "bench.toml".to_string());
@@ -659,12 +660,11 @@ enum BenchWorkload {
     Native,
     Erc20 { token_addresses: Arc<[Address]> },
     Eip2935,
-    Eip7702 { delegate: Address, authorizations: Arc<[SignedAuthorization]> },
+    Eip7702 { delegate: Address },
     /// Mix cycles through all 4 types round-robin per account.
     Mix {
         erc20_tokens: Arc<[Address]>,
         eip7702_delegate: Address,
-        eip7702_auths: Arc<[SignedAuthorization]>,
         counter: Arc<AtomicU64>,
     },
 }
@@ -692,12 +692,10 @@ impl BenchCfg {
             TransferType::Eip2935 => BenchWorkload::Eip2935,
             TransferType::Eip7702 => BenchWorkload::Eip7702 {
                 delegate: Address::ZERO,
-                authorizations: Arc::from(Vec::new()),
             },
             TransferType::Mix => BenchWorkload::Mix {
                 erc20_tokens: token_addresses,
                 eip7702_delegate: Address::ZERO,
-                eip7702_auths: Arc::from(Vec::new()),
                 counter: Arc::new(AtomicU64::new(0)),
             },
         };
@@ -747,14 +745,14 @@ impl BenchCfg {
             BenchWorkload::Eip2935 => {
                 tx::build_eip2935_tx(account, block_number, self.fee_config, chain_id).await
             }
-            BenchWorkload::Eip7702 { authorizations, .. } => {
-                let auth = authorizations[account.nonce as usize % authorizations.len()].clone();
+            BenchWorkload::Eip7702 { delegate, .. } => {
+                // Self-sponsored: auth.nonce must be account.nonce + 1
+                let auth = tx::sign_authorization(account, *delegate, chain_id, account.nonce + 1).await?;
                 tx::build_eip7702_tx(account, auth, self.fee_config, chain_id).await
             }
             BenchWorkload::Mix {
                 erc20_tokens,
-                eip7702_delegate: _,
-                eip7702_auths,
+                eip7702_delegate,
                 counter,
             } => {
                 let idx = counter.fetch_add(1, Ordering::Relaxed) % 4;
@@ -782,8 +780,8 @@ impl BenchCfg {
                             .await
                     }
                     3 => {
-                        let auth =
-                            eip7702_auths[account.nonce as usize % eip7702_auths.len()].clone();
+                        // Self-sponsored: auth.nonce must be account.nonce + 1
+                        let auth = tx::sign_authorization(account, *eip7702_delegate, chain_id, account.nonce + 1).await?;
                         tx::build_eip7702_tx(account, auth, self.fee_config, chain_id).await
                     }
                     _ => unreachable!(),
@@ -808,6 +806,7 @@ async fn run_bench(
     chain_id: u64,
     register_tx: mpsc::Sender<MonitorCommand>,
     pool_size: Arc<AtomicU64>,
+    current_block: Arc<AtomicU64>,
 ) -> Result<()> {
     let worker_keys =
         config::derive_worker_keys(&config.faucet.private_key, config.bench.num_accounts);
@@ -841,36 +840,20 @@ async fn run_bench(
         Address::ZERO
     };
 
-    // Pre-sign EIP-7702 authorizations for each worker
-    let eip7702_auths = if config.bench.needs_eip7702_deploy() {
-        let mut auths = Vec::with_capacity(accounts.len());
-        for account in &accounts {
-            let auth =
-                tx::sign_authorization(account, delegate_address, chain_id).await?;
-            auths.push(auth);
-        }
-        log::info!("[bench] pre-signed {} EIP-7702 authorizations", auths.len());
-        Arc::<[SignedAuthorization]>::from(auths)
-    } else {
-        Arc::<[SignedAuthorization]>::from(Vec::new())
-    };
-
     let mix_erc20_tokens = token_addresses.clone();
     let mut bench_cfg = BenchCfg::from_config(&config.bench, token_addresses, chain_id, &worker_keys)?;
 
-    // Post-resolve Mix config with delegate/auths
+    // Post-resolve workloads that need the delegate address. Auth is signed fresh per tx
+    // in the worker (auth.nonce = account.nonce + 1 for self-sponsored).
     if config.bench.transfer_type == TransferType::Mix {
         bench_cfg.workload = BenchWorkload::Mix {
             erc20_tokens: mix_erc20_tokens,
             eip7702_delegate: delegate_address,
-            eip7702_auths,
             counter: Arc::new(AtomicU64::new(0)),
         };
     } else if config.bench.transfer_type == TransferType::Eip7702 {
-        // Resolve Eip7702 with pre-signed auths
         bench_cfg.workload = BenchWorkload::Eip7702 {
             delegate: delegate_address,
-            authorizations: eip7702_auths,
         };
     }
 
@@ -924,6 +907,7 @@ async fn run_bench(
             active_count.clone(),
             stop.clone(),
             num_accounts,
+            current_block.clone(),
         )));
     }
 
@@ -948,9 +932,10 @@ async fn run_bench_worker(
     active_count: Arc<AtomicUsize>,
     stop: Arc<AtomicBool>,
     num_accounts: usize,
+    current_chain_block: Arc<AtomicU64>,
 ) {
     let estimated_gas = bench_cfg.estimated_gas();
-    let mut block_number = U256::from(0u64);
+    let mut counter: u64 = 0;
 
     loop {
         if stop.load(Ordering::Relaxed) {
@@ -969,6 +954,13 @@ async fn run_bench_worker(
             break;
         }
 
+        // EIP-2935 HISTORY_STORAGE only serves the most recent 8192 blocks.
+        // Query (current_chain_block - 100 - counter % 4000) to stay safely inside the ring
+        // and exercise different slots. For non-eip2935 workloads this value is unused.
+        let chain_head = current_chain_block.load(Ordering::Relaxed);
+        let query_block = chain_head.saturating_sub(100).saturating_sub(counter % 4000);
+        let block_number = U256::from(query_block);
+
         let signed = match bench_cfg.build_tx(&account, chain_id, block_number).await {
             Ok(signed) => signed,
             Err(e) => {
@@ -978,7 +970,27 @@ async fn run_bench_worker(
         };
 
         let tx_hash = tx::raw_tx_hash(&signed.raw);
-        block_number += U256::from(1u64);
+        counter = counter.wrapping_add(1);
+
+        // Register FIRST so monitor has the hash in `pending` before the tx is broadcast.
+        // Without this, monitor may scan past the block where the tx lands before the
+        // worker registers, and the confirmation is missed forever.
+        let (confirm_tx, confirm_rx) = oneshot::channel();
+        let (registered_tx, registered_rx) = oneshot::channel();
+        if register_tx
+            .send(MonitorCommand::Register(RegisterTx {
+                hash: tx_hash,
+                reply: confirm_tx,
+                registered: registered_tx,
+            }))
+            .await
+            .is_err()
+        {
+            break;
+        }
+        if registered_rx.await.is_err() {
+            break;
+        }
 
         // Send via BatchSender
         let (reply_tx, reply_rx) = oneshot::channel();
@@ -1003,24 +1015,6 @@ async fn run_bench_worker(
         }
 
         stats.inc_sent();
-
-        // Register and wait for confirmation
-        let (confirm_tx, confirm_rx) = oneshot::channel();
-        let (registered_tx, registered_rx) = oneshot::channel();
-        if register_tx
-            .send(MonitorCommand::Register(RegisterTx {
-                hash: tx_hash,
-                reply: confirm_tx,
-                registered: registered_tx,
-            }))
-            .await
-            .is_err()
-        {
-            break;
-        }
-        if registered_rx.await.is_err() {
-            break;
-        }
 
         let receipt = match confirm_rx.await {
             Ok(r) => r,
