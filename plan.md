@@ -47,7 +47,6 @@ simple_bench recover  [-c config]
 | `bench.num_accounts` | ✅ | ✅ | ✅ |
 | `bench.num_tokens` | ✅ | ✅ | — |
 | `bench.rpc_concurrency` | ✅ | ✅ | ✅ |
-| `bench.num_inflight_senders` | — | ✅ | — |
 | `bench.max_fee_per_gas` | ✅ | ✅ | ✅ |
 | `bench.max_priority_fee_per_gas` | ✅ | ✅ | ✅ |
 | `bench.max_pool_size` | — | ✅ | — |
@@ -55,8 +54,6 @@ simple_bench recover  [-c config]
 | `bench.faucet_level` | ✅ | — | ✅ |
 | `bench.faucet_eth_per_level` | ✅ | — | — |
 | `bench.rpc_batch_size` | ✅ | ✅ | ✅ |
-
-`num_inflight_senders` 在 bench 中的语义改为**同时进行中的 sender 数量上限**（与 `rpc_concurrency` 解耦）。
 
 `faucet_level`（默认 10）控制 fan-out：master faucet 先分发到 `faucet_level` 个中间账户，这些中间账户再**并行**分发到 `num_accounts` 个测试账户。中间账户不参与 bench 压测，仅在 recover 时回收。
 

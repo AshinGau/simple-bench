@@ -25,7 +25,6 @@ pub struct RpcConfig {
 pub struct BenchConfig {
     pub num_accounts: usize,
     pub rpc_concurrency: usize,
-    pub num_inflight_senders: usize,
     pub transfer_type: TransferType,
     pub max_fee_per_gas: u64,
     pub max_priority_fee_per_gas: u64,
@@ -200,9 +199,6 @@ impl Config {
         if config.bench.rpc_concurrency == 0 {
             anyhow::bail!("bench.rpc_concurrency must be greater than 0");
         }
-        if config.bench.num_inflight_senders == 0 {
-            anyhow::bail!("bench.num_inflight_senders must be greater than 0");
-        }
         if config.bench.transfer_type == TransferType::Erc20 && config.bench.num_tokens == 0 {
             anyhow::bail!("bench.num_tokens must be greater than 0 when transfer_type=erc20");
         }
@@ -214,7 +210,7 @@ impl Config {
 mod tests {
     use std::collections::HashSet;
 
-    use super::{derive_intermediate_keys, derive_worker_keys};
+    use super::{derive_intermediate_keys, derive_worker_keys, Config};
 
     const FAUCET_KEY: &str = "0xa276f0bd98df14e4f795e38f25fd5424f07b7f57d0cadb09a7203b5fca723bdc";
 
@@ -238,5 +234,11 @@ mod tests {
 
         let unique: HashSet<_> = keys.iter().collect();
         assert_eq!(unique.len(), keys.len());
+    }
+
+    #[test]
+    fn template_config_loads() {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/bench.toml.template");
+        Config::load(path).expect("bench.toml.template should be a valid config");
     }
 }
